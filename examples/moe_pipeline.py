@@ -913,12 +913,21 @@ def main():
                     down_key = f"{prefix}.experts.down_proj{suffix}"
                     if gate_up_key in new_tensors:
                         gate_up = new_tensors.pop(gate_up_key)
-                        mid = gate_up.shape[0] // 2
-                        new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate_up[:mid].reshape(num_experts, -1, gate_up.shape[-1]).contiguous() if gate_up.dim() >= 1 else gate_up[:mid]
-                        new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = gate_up[mid:].reshape(num_experts, -1, gate_up.shape[-1]).contiguous() if gate_up.dim() >= 1 else gate_up[mid:]
+                        # gate_up is (E*2H, packed) flattened; reshape to (E, 2H, packed) then split
+                        E = num_experts
+                        H = gate_up.shape[0] // (2 * E)
+                        packed = gate_up.shape[-1]
+                        gate_up_3d = gate_up.reshape(E, 2 * H, packed)
+                        gate = gate_up_3d[:, :H, :].reshape(E * H, packed).contiguous()
+                        up = gate_up_3d[:, H:, :].reshape(E * H, packed).contiguous()
+                        new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate
+                        new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = up
                     if down_key in new_tensors:
                         down = new_tensors.pop(down_key)
-                        new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = down.reshape(num_experts, -1, down.shape[-1]).contiguous() if down.dim() >= 1 else down
+                        # down is (E*H, packed); already correct shape, just ensure 2D
+                        E = num_experts
+                        H = down.shape[0] // E
+                        new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = down.reshape(E * H, -1).contiguous()
             import safetensors.torch as st
             import os
             tmp_path = "/tmp/" + shard_path.name + ".tmp"
