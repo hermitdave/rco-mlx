@@ -48,7 +48,6 @@ class ModelAdapter(ABC):
     # Tensor-type sensitivity hierarchy (from Unsloth Dynamic v3 methodology).
     # Keys are HF checkpoint key fragments; lower value = more sensitive.
     # The default is applied when no specific rule matches.
-    tensor_type_bits: Dict[str, int] = {}
 
     @abstractmethod
     def enumerate_layers(self, source_dir: Path) -> List[Dict]:
@@ -58,20 +57,6 @@ class ModelAdapter(ABC):
     def quant_predicate(self, layer_descriptor: Dict) -> Optional[Dict]:
         """Return a quantization spec for this layer, or None to keep BF16."""
 
-    def quant_predicate_for_key(self, key: str) -> Optional[Dict]:
-        """Return a quantization spec based on tensor-type sensitivity, or None.
-
-        Falls back to ``quant_predicate`` when no sensitivity rule matches.
-        """
-        for fragment, bits in sorted(
-            self.tensor_type_bits.items(), key=lambda kv: -len(kv[0])
-        ):
-            if fragment in key:
-                return {
-                    "bits": bits,
-                    "group_size": self.default_group_size,
-                }
-        return None
 
     @abstractmethod
     def grouping_spec(self) -> Optional[str]:
