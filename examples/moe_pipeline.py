@@ -852,11 +852,23 @@ def main():
         print(f"  achieved {report['achieved_bpw']:.4f} bpw")
         print(f"  histogram: {report['bit_histogram']}")
 
-        # Force experts to uniform 4-bit for sanitize compatibility
+        # Force experts to uniform bitwidth for sanitize compatibility
         # (mixed bits per expert break OlmoeSparseMoeBlock stacking)
+        # Adapt bitwidth to target bpw: lower targets -> lower expert bits
+        if args.target_bpw <= 2.5:
+            expert_bits = 2
+        elif args.target_bpw <= 3.5:
+            expert_bits = 3
+        elif args.target_bpw <= 4.5:
+            expert_bits = 4
+        elif args.target_bpw <= 5.5:
+            expert_bits = 5
+        else:
+            expert_bits = 6
+        print(f"  expert bitwidth: {expert_bits} (target {args.target_bpw} bpw)")
         for k in list(assignment.keys()):
             if "experts" in k.lower() or "switch_mlp" in k.lower() or "switch_glu" in k.lower():
-                assignment[k] = 4
+                assignment[k] = expert_bits
 
     # --- Step 4: emit + validate ---
     print("[4/5] emitting MLX config + validating …")
