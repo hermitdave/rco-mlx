@@ -904,8 +904,8 @@ def main():
         for shard_path in sorted(output.glob("*.safetensors")):
             tensors = st.load_file(str(shard_path))
             new_tensors = dict(tensors)
-            num_layers = json.loads((source / "config.json").read_text()).get("num_hidden_layers") or json.loads((source / "config.json").read_text()).get("text_config", {}).get("num_hidden_layers", 40)
-            num_experts = json.loads((source / "config.json").read_text()).get("num_experts") or json.loads((source / "config.json").read_text()).get("text_config", {}).get("num_experts", 256)
+            num_layers = 40
+            num_experts = 256
             for l in range(num_layers):
                 prefix = f"language_model.model.layers.{l}.mlp"
                 for suffix in [".weight", ".scales", ".biases"]:
