@@ -897,7 +897,7 @@ def main():
     )
 
     # Post-process: apply Qwen3.5 sanitize for quantized weights
-    if model_type == "qwen3_5_moe":
+    if args.model_type == "qwen3_5_moe":
         print("[post] applying Qwen3.5 sanitize for quantized expert weights ...")
         import json as _json
         import safetensors.torch as st
