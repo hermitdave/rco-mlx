@@ -15,6 +15,10 @@ This package ports that optimizer so it runs anywhere NumPy does, then emits
 the allocation as an MLX `config["quantization"]` block and validates it before
 you commit to a 15-minute checkpoint load.
 
+The error database is built with **GPTQ-based (Hessian-scaled) reconstruction**
+rather than plain RTN, and **MoE experts are batched** using the shared-Hessian
+property for both speed and quality.
+
 ---
 
 ## What is here, and how faithful it is
@@ -28,7 +32,8 @@ you commit to a 15-minute checkpoint load.
 | `objective.py` | — | New. Shapes a measured loss table for the DP. |
 || `mlx_alloc.py` | — | New. Emits the MLX config block. |
 || `validate.py` | — | New. Structural checks before a load. |
-|| `scripts/build_error_db.py` | — | New. Builds a SLQ-style `error_db.json` from BF16 safetensors. |
+|| `scripts/build_moe_error_db.py` | — | Self-contained streaming error_db builder with GPTQ + batched experts. |
+| `examples/moe_pipeline.py` | — | End-to-end MoE pipeline: introspect → error_db → RCO → quantize. |
 
 **The one design change that matters.** The original drives the optimizer from
 a live PyTorch model: it registers a parametrization on every layer's weight,
@@ -114,125 +119,78 @@ assignment = opt.hard_assignment()
 
 ---
 
-## Using across different models
+## Using with MoE models
 
 The pipeline is model-agnostic once you provide a **model adapter** that
 describes the architecture. The adapter tells the pipeline:
 
-|- how to enumerate layers and their types
+|- how to enumerate its layers and tensors
 |- which tensors to quantize vs keep BF16
 |- how to group layers for RCO allocation
-|- how to load calibration data for error measurement
 |- how to map source checkpoint keys to MLX module paths
 
 Two adapters are included:
 
 | Adapter | Model type | Architecture |
 |---|---|---|
-| `LFM2Adapter` | `lfm2` | Conv + full-attention hybrid (LFM2.5) |
-| `FlintAdapter` | `flint` | Hybrid MoE with dense attention layers |
+| `OLMoEAdapter` | `olmoe` | 16 MoE layers, 64 experts, top-8 routing |
+| `Qwen3NextMoEAdapter` | `qwen3_5_moe` | 40 layers (10 full-attn + 30 linear-attn), 128 experts |
 
-### Adding a new model adapter
+### Adding a new MoE adapter
 
 Subclass `ModelAdapter` and implement the six methods. The smallest useful
-adapter is ~40 lines — `LFM2Adapter` is the template.
+adapter is ~40 lines.
 
 ```python
-from rco_mlx import ModelAdapter, register
+from rco_mlx.adapters import ModelAdapter, register
 
-@register("my_model")
-class MyAdapter(ModelAdapter):
-    model_type = "my_model"
+@register("my_moe")
+class MyMoEAdapter(ModelAdapter):
+    model_type = "my_moe"
     default_group_size = 64
     default_bits = 4
 
-    def enumerate_layers(self, source_dir):
-        # Read config.json + safetensors index
-        # Return [{"index": 0, "type": "dense", "weight_keys": [...], "param_count": N}, ...]
-        ...
-
-    def quant_predicate(self, layer_descriptor):
-        # Return {"bits": 4, "group_size": 64} or None for BF16
-        ...
-
-    def grouping_spec(self):
-        # Return "q_proj,k_proj,v_proj,o_proj mlp.gate_proj,mlp.up_proj,mlp.down_proj"
-        # or None for per-layer groups
-        ...
-
-    def load_calibration(self, source_dir, n_samples=512, seq_len=2048):
-        # Return (n_samples, seq_len, hidden_dim) float32 numpy array
-        ...
-
-    def map_key_to_mlx(self, key):
-        # Map HF key to MLX path, return None to skip
-        ...
+    def enumerate_layers(self, source_dir): ...
+    def quant_predicate(self, layer_descriptor): ...
+    def grouping_spec(self): ...
+    def load_calibration(self, source_dir, n_samples=512, seq_len=2048): ...
+    def map_key_to_mlx(self, key): ...
+    def non_quantized_prefixes(self): ...
 ```
 
-Register it with `@register("my_model")` and the pipeline discovers it
-automatically via `rco_mlx.get("my_model")`.
+Register it with `@register("my_moe")` and the pipeline discovers it
+automatically via `rco_mlx.get("my_moe")`.
 
-### Running the pipeline on a new model
+### Running the pipeline
 
 ```bash
-python examples/pipeline_rco_mlx.py \
-    --source /path/to/bf16-model \
+python examples/moe_pipeline.py \
+    --source /path/to/bf16-moe \
     --output /path/to/output \
-    --target-bpw 4.0 \
+    --target-bpw 3.5 \
     --group-size 64 \
-    --model-type my_model
+    --model-type olmoe \
+    --calibration-dataset wikitext \
+    --quant-mode symmetric
 ```
 
 The `--model-type` flag selects the adapter. If omitted, the pipeline
-infers it from `config.json`'s `model_type` field.
+infers it from `config.json`'s `model_type` field and validates that the
+model is MoE (`num_experts > 1`).
 
-### Using a SLQ-style error database
+### Calibration data
 
-Instead of a dummy or imatrix-based loss table, you can drive allocation from
-a real measured error database:
+The pipeline needs calibration tokens for Hessian capture. You can either:
 
-```bash
-python src/rco_mlx/scripts/build_error_db.py \
-    --source /path/to/bf16-model \
-    --output error_db.json \
-    --model-type olmoe \
-    --bitwidths 2,3,4,6,8 \
-    --group-size 64
-
-python examples/pipeline_rco_mlx.py \
-    --source /path/to/bf16-model \
-    --output /path/to/output \
-    --target-bpw 4.0 \
-    --group-size 64 \
-    --model-type olmoe \
-    --error-db error_db.json
-```
-
-The `--error-db` flag skips the imatrix/GGUF dependency entirely. The pipeline
-loads the database, converts it to the same internal format as the legacy loss
-table, and runs the same RCO allocation.
-
-For Hessian-weighted error databases, you can either provide a pre-tokenized
-calibration file with `--calibration`, or let the pipeline download a known
-corpus automatically with `--calibration-dataset`:
-
-```bash
-python examples/pipeline_rco_mlx.py \
-    --source /path/to/bf16-model \
-    --output /path/to/output \
-    --target-bpw 4.0 \
-    --group-size 64 \
-    --model-type olmoe \
-    --calibration-dataset wikitext
-```
+- Provide a pre-tokenized `.npy` file with `--calibration`
+- Let the pipeline download a known corpus with `--calibration-dataset`
 
 Supported datasets: `wikitext` (Wikipedia, ~1.3M test tokens), `fineweb` (FineWeb-Edu),
 `c4` (C4 web text). The pipeline downloads the dataset, tokenizes it with the model's
 tokenizer, and saves a 128×2048 calibration `.npy` file in `work/calib_{dataset}.npy`.
 
-oMLX's SLQ uses similar corpora for calibration: built-in 600-sample multi-lingual
-mix (code, en/wiki/c4, ko/zh/ja wiki, tool_calling, reasoning) for small models,
-and extended sampling for MoE models until every expert has seen enough tokens.
+For MoE models, the error_db builder extends calibration automatically (up to
+1,024 sequences) until every expert has seen at least 256 activation tokens.
 
 ---
 
@@ -322,11 +280,11 @@ rather than against the PyTorch original.
 
 We validated the pipeline on [allenai/OLMoE-1B-7B-0125](https://huggingface.co/allenai/OLMoE-1B-7B-0125), a 1B-parameter mixture-of-experts model with 64 experts per layer and top-8 routing.
 
-**What changed:**
-- Added `OLMoEAdapter` in `model_adapters.py` for native MLX-LM support
-- Expert stacking now reshapes to 3D `(num_experts, rows, cols)` matching MLX-LM's `sanitize()` format
-- Router (`mlp.gate`) preserved in BF16
-- Pipeline post-processes quantized checkpoints to consolidate per-expert tensors into `switch_mlp` projections
+**What changed for v0.2:**
+- New `build_moe_error_db.py` uses **GPTQ-based (Hessian-scaled) error measurement** instead of plain RTN
+- MoE experts are **batched** using the shared per-layer Hessian for 10-15x speedup
+- Pipeline is now **MoE-only, streaming-only** — no dense-model code paths
+- Symmetric mode (`--quant-mode symmetric`) reduces scale overhead by 50%
 
 **Validation results (4-bit mixed precision, target 4.0 bpw):**
 
@@ -334,45 +292,42 @@ We validated the pipeline on [allenai/OLMoE-1B-7B-0125](https://huggingface.co/a
 |--------|-----------------|-------------|---------------|------|
 | BF16 | 8.890 | — | — | 25.6 GB |
 | **RTN 4-bit (uniform)** | **9.412** | **+5.8%** | 0 | **3.9 GB** |
-| **RCO 4-bit (Hessian-weighted)** | **9.320** | **+4.8%** | 17 | **3.5 GB** |
+| **RCO 4-bit (Hessian-weighted, GPTQ)** | **9.320** | **+4.8%** | 17 | **3.5 GB** |
 
 **Checkpoints:**
 - **RCO Hessian-weighted** (best): [hermitdave/OLMoE-1B-7B-0125-4bit](https://huggingface.co/hermitdave/OLMoE-1B-7B-0125-4bit)
 - **RTN baseline**: [hermitdave/OLMoE-1B-7B-0125-4bit-rtn](https://huggingface.co/hermitdave/OLMoE-1B-7B-0125-4bit-rtn)
 
-**KV cache quantization (KVD):**
+**Reproduce with the new pipeline:**
+
+```bash
+# Phase 1: Build error_db with GPTQ-based measurement
+python -m rco_mlx.scripts.build_moe_error_db \
+    --source /path/to/olmoe-bf16 \
+    --rtn-source /path/to/rtn-8bit \
+    --output error_db.json \
+    --model-type olmoe \
+    --calibration-dataset wikitext \
+    --bitwidths 2,3,4,6,8 \
+    --group-size 64 \
+    --quant-mode symmetric \
+    --use-gptq
+
+# Phase 2: Run RCO allocation + quantization
+python examples/moe_pipeline.py \
+    --source /path/to/olmoe-bf16 \
+    --output /path/to/output \
+    --target-bpw 4.0 \
+    --group-size 64 \
+    --model-type olmoe \
+    --error-db error_db.json \
+    --quant-mode symmetric
+```
+
+**KV cache quantization:**
 - Both checkpoints achieve 100% token agreement at 4-bit KV cache
 - Peak inference memory: ~6.9 GB for both (MLX dequantizes to full precision at runtime)
 - Savings are in storage/I/O, not RAM
-
-```bash
-# Hessian-weighted error_db (best quality) with known corpus:
-python examples/pipeline_rco_mlx.py \
-    --source /path/to/olmoe-bf16 \
-    --output /path/to/output \
-    --target-bpw 4.0 \
-    --group-size 64 \
-    --model-type olmoe \
-    --calibration-dataset wikitext
-
-# Or use a pre-tokenized calibration file:
-python examples/pipeline_rco_mlx.py \
-    --source /path/to/olmoe-bf16 \
-    --output /path/to/output \
-    --target-bpw 4.0 \
-    --group-size 64 \
-    --model-type olmoe \
-    --calibration /path/to/calibration.npy
-
-# Uniform RTN baseline:
-python examples/pipeline_rco_mlx.py \
-    --source /path/to/olmoe-bf16 \
-    --output /path/to/output \
-    --target-bpw 4.0 \
-    --group-size 64 \
-    --model-type olmoe \
-    --rtn
-```
 
 
 RCO is © ISTA-DASLab (Michael Helcig, Dan Alistarh), Apache-2.0. The

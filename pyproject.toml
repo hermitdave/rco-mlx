@@ -4,19 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rco-mlx"
-version = "0.1.0"
-description = "RCO budget-constrained mixed-precision allocation ported to NumPy, with MLX config emission"
+version = "0.2.0"
+description = "RCO budget-constrained mixed-precision quantization for MoE models on MLX"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Hermit Dave" }]
-keywords = ["quantization", "mixed-precision", "mlx", "rco", "llm"]
+keywords = ["quantization", "mixed-precision", "mlx", "moe", "rco", "llm"]
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 mlx = ["mlx>=0.20"]
 calib = ["transformers>=4.0", "datasets>=3.0"]
 test = ["pytest>=7"]
+
+[project.scripts]
+rco-moe-quant = "examples.moe_pipeline:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

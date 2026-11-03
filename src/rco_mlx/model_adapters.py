@@ -8,10 +8,6 @@ compatibility. New code should import from ``rco_mlx.adapters`` instead.
 
 from .adapters import (  # noqa: F401
     ModelAdapter,
-    DefaultAdapter,
-    FlintAdapter,
-    LFM2Adapter,
-    LFM2MoEAdapter,
     OLMoEAdapter,
     Qwen3NextMoEAdapter,
     get,
@@ -20,10 +16,6 @@ from .adapters import (  # noqa: F401
 
 __all__ = [
     "ModelAdapter",
-    "DefaultAdapter",
-    "FlintAdapter",
-    "LFM2Adapter",
-    "LFM2MoEAdapter",
     "OLMoEAdapter",
     "Qwen3NextMoEAdapter",
     "get",

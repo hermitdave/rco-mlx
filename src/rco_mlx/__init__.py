@@ -47,10 +47,6 @@ from .mlx_alloc import (
 )
 from .adapters import (
     ModelAdapter,
-    DefaultAdapter,
-    FlintAdapter,
-    LFM2Adapter,
-    LFM2MoEAdapter,
     OLMoEAdapter,
     Qwen3NextMoEAdapter,
     get,
@@ -65,7 +61,7 @@ from .objective import (
 from .search import ProjectedGumbelOptimizer, budget_dp, values_from_losses
 from .validate import ValidationReport, assert_coverage, validate_allocation
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # grouping
@@ -99,10 +95,6 @@ __all__ = [
     "recover_bits_from_packed_shape",
     # adapters
     "ModelAdapter",
-    "DefaultAdapter",
-    "FlintAdapter",
-    "LFM2Adapter",
-    "LFM2MoEAdapter",
     "OLMoEAdapter",
     "Qwen3NextMoEAdapter",
     "get",

@@ -28,16 +28,33 @@ class Qwen3NextMoEAdapter(ModelAdapter):
     default_group_size = 64
     default_bits = 4
 
+    # Tensor-type sensitivity hierarchy (Unsloth Dynamic v3 findings).
+    # More sensitive tensors get higher bit widths.
+    tensor_type_bits = {
+        # Routed experts: down_proj is most sensitive
+        "experts.0.down_proj": 4,
+        "experts.0.gate_up_proj": 3,
+        # Shared expert
+        "shared_expert.down_proj": 4,
+        "shared_expert.gate_up_proj": 3,
+        # Attention projections
+        "self_attn.q_proj": 5,
+        "self_attn.k_proj": 5,
+        "self_attn.v_proj": 5,
+        "self_attn.o_proj": 5,
+        # Linear attention (Gated DeltaNet) — less sensitive than full attention
+        "linear_attn.in_proj_a": 4,
+        "linear_attn.in_proj_b": 4,
+        "linear_attn.in_proj_qkv": 4,
+        "linear_attn.in_proj_z": 4,
+        "linear_attn.out_proj": 4,
+    }
+
     _BF16_PREFIXES = (
-        "embed_tokens",
-        "lm_head",
-        "norm",
-        "layernorm",
-        "q_norm",
-        "k_norm",
         "mlp.gate",
         "conv.conv",
         "linear_attn.conv1d",
+        "visual",
     )
 
     def enumerate_layers(self, source_dir: Path) -> List[Dict]:
@@ -105,9 +122,9 @@ class Qwen3NextMoEAdapter(ModelAdapter):
         mlx = mlx.replace("language_model.layers", "language_model.model.layers")
 
         if ".mlp.experts.down_proj" in mlx:
-            mlx = mlx.replace(".mlp.experts.down_proj", ".mlp.switch_mlp.down_proj")
+            mlx = mlx.replace(".mlp.experts.down_proj", ".mlp.experts.down_proj")
         if ".mlp.experts.gate_up_proj" in mlx:
-            mlx = mlx.replace(".mlp.experts.gate_up_proj", ".mlp.switch_mlp.gate_proj")
+            mlx = mlx.replace(".mlp.experts.gate_up_proj", ".mlp.experts.gate_up_proj")
         if ".mlp.shared_expert." in mlx:
             mlx = mlx.replace(".mlp.shared_expert.down_proj.", ".mlp.shared_expert.down_proj.")
             mlx = mlx.replace(".mlp.shared_expert.gate_up_proj.", ".mlp.shared_expert.gate_proj.")

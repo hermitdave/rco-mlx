@@ -28,6 +28,20 @@ class OLMoEAdapter(ModelAdapter):
     default_group_size = 64
     default_bits = 4
 
+    # Tensor-type sensitivity hierarchy (Unsloth Dynamic v3 findings).
+    # More sensitive tensors get higher bit widths.
+    tensor_type_bits = {
+        # Routed experts: down_proj is most sensitive (projects back to residual)
+        "experts.0.w2": 4,      # down_proj — 4 bit min
+        "experts.0.w1": 3,      # gate_proj — 3 bit OK
+        "experts.0.w3": 3,      # up_proj — 3 bit OK
+        # Attention projections
+        "self_attn.q_proj": 5,
+        "self_attn.k_proj": 5,
+        "self_attn.v_proj": 5,
+        "self_attn.o_proj": 5,
+    }
+
     _BF16_PREFIXES = (
         "embed_tokens",
         "lm_head",
@@ -66,10 +80,23 @@ class OLMoEAdapter(ModelAdapter):
         return layers
 
     def quant_predicate(self, layer_descriptor: Dict) -> Optional[Dict]:
+        # Default: apply tensor-type sensitivity if available
         return {
             "bits": self.default_bits,
             "group_size": self.default_group_size,
         }
+
+    def quant_predicate_for_key(self, key: str) -> Optional[Dict]:
+        # Use tensor-type sensitivity hierarchy
+        for fragment, bits in sorted(
+            self.tensor_type_bits.items(), key=lambda kv: -len(kv[0])
+        ):
+            if fragment in key:
+                return {
+                    "bits": bits,
+                    "group_size": self.default_group_size,
+                }
+        return None
 
     def grouping_spec(self) -> Optional[str]:
         return (
@@ -98,7 +125,8 @@ class OLMoEAdapter(ModelAdapter):
 
     def map_key_to_mlx(self, key: str) -> Optional[str]:
         for prefix in self._BF16_PREFIXES:
-            if key.startswith(f"model.{prefix}.") or key == f"model.{prefix}":
+            # Handle both "model.xxx" and bare "xxx" key styles
+            if key.startswith(f"model.{prefix}.") or key.startswith(f"{prefix}.") or key == f"model.{prefix}" or key == prefix:
                 return None
 
         if ".mlp.experts." in key:
