@@ -905,6 +905,7 @@ def main():
             tensors = st.load_file(str(shard_path))
             new_tensors = dict(tensors)
             num_layers = json.loads((source / "config.json").read_text()).get("num_hidden_layers") or json.loads((source / "config.json").read_text()).get("text_config", {}).get("num_hidden_layers", 40)
+            num_experts = json.loads((source / "config.json").read_text()).get("num_experts") or json.loads((source / "config.json").read_text()).get("text_config", {}).get("num_experts", 256)
             for l in range(num_layers):
                 prefix = f"language_model.model.layers.{l}.mlp"
                 for suffix in [".weight", ".scales", ".biases"]:
@@ -913,10 +914,11 @@ def main():
                     if gate_up_key in new_tensors:
                         gate_up = new_tensors.pop(gate_up_key)
                         mid = gate_up.shape[0] // 2
-                        new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate_up[:mid].contiguous() if gate_up.dim() >= 1 else gate_up[:mid]
-                        new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = gate_up[mid:].contiguous() if gate_up.dim() >= 1 else gate_up[mid:]
+                        new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate_up[:mid].reshape(num_experts, -1, gate_up.shape[-1]).contiguous() if gate_up.dim() >= 1 else gate_up[:mid]
+                        new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = gate_up[mid:].reshape(num_experts, -1, gate_up.shape[-1]).contiguous() if gate_up.dim() >= 1 else gate_up[mid:]
                     if down_key in new_tensors:
-                        new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = new_tensors.pop(down_key)
+                        down = new_tensors.pop(down_key)
+                        new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = down.reshape(num_experts, -1, down.shape[-1]).contiguous() if down.dim() >= 1 else down
             import safetensors.torch as st
             import os
             tmp_path = "/tmp/" + shard_path.name + ".tmp"
