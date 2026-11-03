@@ -912,9 +912,9 @@ def main():
                     down_key = f"{prefix}.experts.down_proj{suffix}"
                     if gate_up_key in new_tensors:
                         gate_up = new_tensors.pop(gate_up_key)
-                        mid = gate_up.shape[-2] // 2
-                        new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate_up[..., :mid, :].contiguous()
-                        new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = gate_up[..., mid:, :].contiguous()
+                        mid = gate_up.shape[0] // 2
+                        new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate_up[:mid].contiguous() if gate_up.dim() >= 1 else gate_up[:mid]
+                        new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = gate_up[mid:].contiguous() if gate_up.dim() >= 1 else gate_up[mid:]
                     if down_key in new_tensors:
                         new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = new_tensors.pop(down_key)
             st.save_file(new_tensors, str(shard_path))
