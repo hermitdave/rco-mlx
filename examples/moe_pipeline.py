@@ -915,8 +915,8 @@ def main():
                         mid = gate_up.shape[-2] // 2
                         new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate_up[..., :mid, :].contiguous()
                         new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = gate_up[..., mid:, :].contiguous()
-                        if down_key in new_tensors:
-                            new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = new_tensors.pop(down_key)
+                    if down_key in new_tensors:
+                        new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = new_tensors.pop(down_key)
             st.save_file(new_tensors, str(shard_path))
             print(f"  sanitized {shard_path.name}")
         # Update config.json quantization keys
