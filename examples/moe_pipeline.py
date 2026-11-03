@@ -425,7 +425,7 @@ def stream_quantize(
                         # Stacked MoE expert tensor: quantize ALL experts in batch
                         E, H, I = tensor.shape
                         flat = tensor.reshape(E * H, I)
-                        w_flat = mx.array(flat.astype(np.float32))
+                        w_flat = flat.astype(mx.float32)
                         q_flat, scales_flat, biases_flat = mx.quantize(
                             w_flat, bits=bits, group_size=group_size, mode=quant_mode
                         )
@@ -866,16 +866,16 @@ def main():
             expert_bits = 5
         else:
             expert_bits = 6
-    print(f"  expert bitwidth: {expert_bits} (target {args.target_bpw} bpw)")
-    # Add all expert groups to assignment with uniform bitwidth
-    for g in groups:
-        name = g.layer_names[0]
-        low = name.lower()
-        if ("experts" in low or "switch_mlp" in low or "switch_glu" in low) and name not in assignment:
-            assignment[name] = expert_bits
-    for k in list(assignment.keys()):
-        if "experts" in k.lower() or "switch_mlp" in k.lower() or "switch_glu" in k.lower():
-            assignment[k] = expert_bits
+        print(f"  expert bitwidth: {expert_bits} (target {args.target_bpw} bpw)")
+        # Add all expert groups to assignment with uniform bitwidth
+        for g in groups:
+            name = g.layer_names[0]
+            low = name.lower()
+            if ("experts" in low or "switch_mlp" in low or "switch_glu" in low) and name not in assignment:
+                assignment[name] = expert_bits
+        for k in list(assignment.keys()):
+            if "experts" in k.lower() or "switch_mlp" in k.lower() or "switch_glu" in k.lower():
+                assignment[k] = expert_bits
 
     # --- Step 4: emit + validate ---
     print("[4/5] emitting MLX config + validating …")
