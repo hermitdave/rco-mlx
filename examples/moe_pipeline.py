@@ -430,7 +430,7 @@ def stream_quantize(
                             w_flat, bits=bits, group_size=group_size, mode=quant_mode
                         )
                         mx.eval(q_flat, scales_flat, biases_flat)
-                        q_stacked = np.array(q_flat).reshape(E, H, I).astype(np.uint32)
+                        q_stacked = np.array(q_flat).reshape(E, H, -1).astype(np.uint32)
                         weight_key = mlx_key if mlx_key.endswith(".weight") else mlx_key + ".weight"
                         results[weight_key] = torch.from_numpy(q_stacked)
 
