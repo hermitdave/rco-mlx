@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare BF16 vs RCO vs AD-ladder on PPL, KL, top-1 agreement."""
+"""Compare BF16 vs RCO vs AD-ladder vs Unsloth on PPL, KL, top-1 agreement."""
 import argparse, json, gc
 from pathlib import Path
 import mlx.core as mx
@@ -12,18 +12,14 @@ def load_model(path):
     return model, tok
 
 def compute_logits(model, ids):
-    # ids: (1, seq) or (batch, seq)
     x = mx.array(ids)
     logits = model(x)
     mx.eval(logits)
     return logits
 
 def ppl(logits, ids):
-    # ids: (batch, seq); logits: (batch, seq, vocab)
-    # shift: predict token[i+1] from logits[i]
     logp = nn.log_softmax(logits[:, :-1, :], axis=-1)
     targets = mx.array(ids[:, 1:])
-    # gather
     gathered = mx.take_along_axis(logp, targets[..., None], axis=-1).squeeze(-1)
     return float(mx.exp(-mx.mean(gathered)))
 
@@ -48,10 +44,8 @@ def main():
     args = ap.parse_args()
 
     calib = np.load(args.calib)
-    ids = calib[:4, :args.max_tokens].astype(np.int32)  # 4 samples
-    np.save("/tmp/bench_ids.npy", ids)
+    ids = calib[:4, :args.max_tokens].astype(np.int32)
 
-    # BF16: compute logits and cache
     print("Loading BF16...")
     model, tok = load_model(args.bf16)
     logits_bf = compute_logits(model, ids)
@@ -60,22 +54,18 @@ def main():
     print(f"BF16 PPL: {ppl_bf:.4f}")
     del model; mx.clear_cache(); gc.collect()
 
-    # RCO
     print("Loading RCO...")
     model, tok = load_model(args.rco)
     logits_rco = compute_logits(model, ids)
-    np.save("/tmp/bench_logits_rco.npy", np.array(logits_rco))
     ppl_rco = ppl(logits_rco, ids)
     kl_rco = kl_div(logits_rco, mx.array(np.load("/tmp/bench_logits_bf.npy")))
     t1_rco = top1_agree(logits_rco, mx.array(np.load("/tmp/bench_logits_bf.npy")))
     print(f"RCO  PPL: {ppl_rco:.4f}  KL: {kl_rco:.4f}  top1: {t1_rco:.4f}")
     del model; mx.clear_cache(); gc.collect()
 
-    # AD ladder
     print("Loading AD ladder...")
     model, tok = load_model(args.adladder)
     logits_ad = compute_logits(model, ids)
-    np.save("/tmp/bench_logits_ad.npy", np.array(logits_ad))
     ppl_ad = ppl(logits_ad, ids)
     kl_ad = kl_div(logits_ad, mx.array(np.load("/tmp/bench_logits_bf.npy")))
     t1_ad = top1_agree(logits_ad, mx.array(np.load("/tmp/bench_logits_bf.npy")))
