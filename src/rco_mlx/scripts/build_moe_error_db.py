@@ -124,6 +124,8 @@ def wrap_linear_layers(model):
         for part in parts:
             obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
         if isinstance(obj, nn.Linear) and not isinstance(obj, _CaptureLinear):
+            if not hasattr(obj, "weight") or not hasattr(obj.weight, "shape"):
+                continue
             wrapper = _CaptureLinear(
                 input_dims=obj.weight.shape[1],
                 output_dims=obj.weight.shape[0],
@@ -139,6 +141,8 @@ def wrap_linear_layers(model):
             _set_module_by_path(model, name, wrapper)
             wrapped.append(name)
         elif isinstance(obj, nn.QuantizedLinear) and not isinstance(obj, _CaptureQuantized):
+            if not hasattr(obj, "weight") or not hasattr(obj.weight, "shape"):
+                continue
             wrapper = _CaptureQuantized(obj)
             _set_module_by_path(model, name, wrapper)
             wrapped.append(name)

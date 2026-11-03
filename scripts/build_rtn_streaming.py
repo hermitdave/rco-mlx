@@ -31,6 +31,13 @@ def process_shard(shard_path, bits, group_size):
         for key in f.keys():
             tensor = f.get_tensor(key)
             if key.endswith(".weight") and tensor.ndim == 2:
+                if "embed" in key or "lm_head" in key:
+                    results[key] = tensor.to(torch.bfloat16) if tensor.dtype != torch.bfloat16 else tensor
+                    continue
+                if tensor.shape[-1] % group_size != 0:
+                    # Skip tensors not divisible by group_size (keep BF16)
+                    results[key] = tensor.to(torch.bfloat16) if tensor.dtype != torch.bfloat16 else tensor
+                    continue
                 q, s, b = quantize_tensor(tensor, bits, group_size)
                 results[key] = torch.from_numpy(q)
                 results[f"{key}.scales"] = torch.from_numpy(s)
@@ -83,4 +90,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
