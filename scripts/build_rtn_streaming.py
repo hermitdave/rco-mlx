@@ -31,7 +31,7 @@ def process_shard(shard_path, bits, group_size):
         for key in f.keys():
             tensor = f.get_tensor(key)
             if key.endswith(".weight") and tensor.ndim == 2:
-                if "embed" in key or "lm_head" in key or "linear_attn" in key or ".gate" in key or "gate_proj" in key:
+                if "embed" in key or "lm_head" in key or "linear_attn" in key or ".gate" in key or "gate_proj" in key or "shared_expert" in key:
                     results[key] = tensor.to(torch.bfloat16) if tensor.dtype != torch.bfloat16 else tensor
                     continue
                 if tensor.shape[-1] % group_size != 0:
