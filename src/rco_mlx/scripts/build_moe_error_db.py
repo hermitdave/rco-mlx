@@ -81,7 +81,7 @@ class _CaptureSwitchLinear(nn.Module):
         self._last_input = None
         self._expert_counts = None
 
-    def __call__(self, x, expert_indices=None):
+    def __call__(self, x, expert_indices=None, **kwargs):
         self._last_input = x
         if expert_indices is not None:
             if self._expert_counts is None:
@@ -90,7 +90,7 @@ class _CaptureSwitchLinear(nn.Module):
                 )
             for eidx in expert_indices:
                 self._expert_counts[eidx] += 1
-        return self._original(x, expert_indices=expert_indices)
+        return self._original(x, expert_indices=expert_indices, **kwargs)
 
 
 def _set_module_by_path(model, path: str, new_module):
