@@ -917,7 +917,11 @@ def main():
                         new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = gate_up[mid:].contiguous() if gate_up.dim() >= 1 else gate_up[mid:]
                     if down_key in new_tensors:
                         new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = new_tensors.pop(down_key)
-            st.save_file(new_tensors, str(shard_path))
+            import safetensors.torch as st
+            import os
+            tmp_path = "/tmp/" + shard_path.name + ".tmp"
+            st.save_file(new_tensors, tmp_path)
+            os.replace(tmp_path, str(shard_path))
             print(f"  sanitized {shard_path.name}")
         # Update config.json quantization keys
         cfg_path = output / "config.json"
