@@ -126,6 +126,11 @@ def wrap_linear_layers(model):
         if isinstance(obj, nn.Linear) and not isinstance(obj, _CaptureLinear):
             if not hasattr(obj, "weight") or not hasattr(obj.weight, "shape"):
                 continue
+            if isinstance(obj.weight, (dict, list, tuple)):
+                continue
+            # Ensure weight is an array/tensor, not a container
+            if not hasattr(obj.weight, "dtype"):
+                continue
             wrapper = _CaptureLinear(
                 input_dims=obj.weight.shape[1],
                 output_dims=obj.weight.shape[0],
