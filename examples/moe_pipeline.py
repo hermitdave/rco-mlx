@@ -791,8 +791,6 @@ def main():
                     assignment[n] = nxt
                 current = weighted_bpw(assignment)
 
-        import json
-        from collections import Counter
         hist = Counter(assignment.values())
         print(f"  adjusted bpw: {current:.4f}")
         print(f"  {len(assignment)} groups allocated")
