@@ -425,7 +425,7 @@ def stream_quantize(
                         # Stacked MoE expert tensor: quantize ALL experts in batch
                         E, H, I = tensor.shape
                         flat = tensor.reshape(E * H, I)
-                        w_flat = flat.astype(mx.float32)
+                        w_flat = mx.array(flat.float().numpy())
                         q_flat, scales_flat, biases_flat = mx.quantize(
                             w_flat, bits=bits, group_size=group_size, mode=quant_mode
                         )
