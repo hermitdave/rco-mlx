@@ -896,8 +896,42 @@ def main():
         model_adapter=model_adapter, quant_mode=args.quant_mode,
     )
 
-    print(f"\n{'='*60}")
-    print(f"Pipeline complete. Output: {output}")
+    # Post-process: apply Qwen3.5 sanitize for quantized weights
+    if model_type == "qwen3_5_moe":
+        print("[post] applying Qwen3.5 sanitize for quantized expert weights ...")
+        import json as _json
+        import safetensors.torch as st
+        for shard_path in sorted(output.glob("*.safetensors")):
+            tensors = st.load_file(str(shard_path))
+            new_tensors = dict(tensors)
+            num_layers = json.loads((source / "config.json").read_text()).get("num_hidden_layers", 40)
+            for l in range(num_layers):
+                prefix = f"language_model.model.layers.{l}.mlp"
+                for suffix in [".weight", ".scales", ".biases"]:
+                    gate_up_key = f"{prefix}.experts.gate_up_proj{suffix}"
+                    down_key = f"{prefix}.experts.down_proj{suffix}"
+                    if gate_up_key in new_tensors:
+                        gate_up = new_tensors.pop(gate_up_key)
+                        mid = gate_up.shape[-2] // 2
+                        new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate_up[..., :mid, :].contiguous()
+                        new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = gate_up[..., mid:, :].contiguous()
+                        if down_key in new_tensors:
+                            new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = new_tensors.pop(down_key)
+            st.save_file(new_tensors, str(shard_path))
+            print(f"  sanitized {shard_path.name}")
+        # Update config.json quantization keys
+        cfg_path = output / "config.json"
+        cfg_data = json.loads(cfg_path.read_text())
+        qc = cfg_data.get("quantization", {})
+        if isinstance(qc, dict):
+            final_qc = {}
+            for k, v in qc.items():
+                nk = k.replace("experts.gate_up_proj", "switch_mlp.gate_proj")
+                nk = nk.replace("experts.down_proj", "switch_mlp.down_proj")
+                final_qc[nk] = v
+            cfg_data["quantization"] = final_qc
+            cfg_path.write_text(json.dumps(cfg_data, indent=2))
+            print("  config updated")
     print(f"Config: {output / 'config.json'}")
     print(f"{'='*60}")
 
