@@ -81,16 +81,16 @@ class _CaptureSwitchLinear(nn.Module):
         self._last_input = None
         self._expert_counts = None
 
-    def __call__(self, x, expert_indices=None, **kwargs):
+    def __call__(self, x, indices=None, sorted_indices=False, **kwargs):
         self._last_input = x
-        if expert_indices is not None:
+        if indices is not None:
             if self._expert_counts is None:
                 self._expert_counts = np.zeros(
                     getattr(self._original, "weight").shape[0], dtype=np.int64
                 )
-            for eidx in expert_indices:
+            for eidx in indices:
                 self._expert_counts[eidx] += 1
-        return self._original(x, expert_indices=expert_indices, **kwargs)
+        return self._original(x, indices, sorted_indices=sorted_indices, **kwargs)
 
 
 def _set_module_by_path(model, path: str, new_module):
