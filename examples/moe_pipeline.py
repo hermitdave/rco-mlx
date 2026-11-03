@@ -913,13 +913,27 @@ def main():
                     down_key = f"{prefix}.experts.down_proj{suffix}"
                     if gate_up_key in new_tensors:
                         gate_up = new_tensors.pop(gate_up_key)
-                        if gate_up.dim() >= 3:
+                        if suffix in [".scales", ".biases"]:
+                            # 2D: (E*2H, packed) -> split along dim 0, reshape to 3D
+                            mid = gate_up.shape[0] // 2
+                            E = num_experts
+                            H = mid // E
+                            packed = gate_up.shape[-1]
+                            gate_up_3d = gate_up.reshape(E, 2 * H, packed)
+                            gate = gate_up_3d[:, :H, :].reshape(E * H, packed).contiguous()
+                            up = gate_up_3d[:, H:, :].reshape(E * H, packed).contiguous()
+                            # Reshape to 3D: (E, H, packed)
+                            gate = gate.reshape(E, H, packed).contiguous()
+                            up = up.reshape(E, H, packed).contiguous()
+                            new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate
+                            new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = up
+                        elif gate_up.dim() >= 3:
                             # 3D: (E, 2H, packed) -> split along dim 1
                             mid = gate_up.shape[1] // 2
                             new_tensors[f"{prefix}.switch_mlp.gate_proj{suffix}"] = gate_up[:, :mid, :].contiguous()
                             new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = gate_up[:, mid:, :].contiguous()
                         else:
-                            # 2D: (E*2H, packed) -> split along dim 0
+                            # 2D weight: (E*2H, packed) -> split along dim 0
                             mid = gate_up.shape[0] // 2
                             E = num_experts
                             H = mid // E
@@ -931,8 +945,14 @@ def main():
                             new_tensors[f"{prefix}.switch_mlp.up_proj{suffix}"] = up
                     if down_key in new_tensors:
                         down = new_tensors.pop(down_key)
-                        # down is already correct shape (2D or 3D), just rename
-                        new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = down
+                        if suffix in [".scales", ".biases"] and down.dim() == 2:
+                            # Reshape 2D (E*H, packed) -> 3D (E, H, packed)
+                            E = num_experts
+                            H = down.shape[0] // E
+                            packed = down.shape[-1]
+                            new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = down.reshape(E, H, packed).contiguous()
+                        else:
+                            new_tensors[f"{prefix}.switch_mlp.down_proj{suffix}"] = down
             import safetensors.torch as st
             import os
             tmp_path = "/tmp/" + shard_path.name + ".tmp"
