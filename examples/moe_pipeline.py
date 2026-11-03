@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 import shutil
 import subprocess
 import sys
 import time
+import json
 from collections import Counter
 from pathlib import Path
 
@@ -789,6 +791,7 @@ def main():
                     assignment[n] = nxt
                 current = weighted_bpw(assignment)
 
+        import json
         from collections import Counter
         hist = Counter(assignment.values())
         print(f"  adjusted bpw: {current:.4f}")
@@ -865,10 +868,16 @@ def main():
             expert_bits = 5
         else:
             expert_bits = 6
-        print(f"  expert bitwidth: {expert_bits} (target {args.target_bpw} bpw)")
-        for k in list(assignment.keys()):
-            if "experts" in k.lower() or "switch_mlp" in k.lower() or "switch_glu" in k.lower():
-                assignment[k] = expert_bits
+    print(f"  expert bitwidth: {expert_bits} (target {args.target_bpw} bpw)")
+    # Add all expert groups to assignment with uniform bitwidth
+    for g in groups:
+        name = g.layer_names[0]
+        low = name.lower()
+        if ("experts" in low or "switch_mlp" in low or "switch_glu" in low) and name not in assignment:
+            assignment[name] = expert_bits
+    for k in list(assignment.keys()):
+        if "experts" in k.lower() or "switch_mlp" in k.lower() or "switch_glu" in k.lower():
+            assignment[k] = expert_bits
 
     # --- Step 4: emit + validate ---
     print("[4/5] emitting MLX config + validating …")
