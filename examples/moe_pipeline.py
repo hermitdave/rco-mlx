@@ -318,7 +318,9 @@ def _is_quantizable(path: str) -> bool:
     check = path if path.endswith(".weight") else path + ".weight"
     if "norm" in check or "embed" in check or "lm_head" in check or "mtp" in check:
         return False
-    if check.endswith(".gate_proj.weight"):
+    # Routed-expert gate_proj IS quantizable (it stacks into the fused
+    # switch_mlp); only standalone gate projections are excluded.
+    if check.endswith(".gate_proj.weight") and ".experts." not in check:
         return False
     return check.endswith(".weight")
 
