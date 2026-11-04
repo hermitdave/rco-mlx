@@ -235,19 +235,20 @@ def load_error_db(path: Path, group_names: list | None = None) -> tuple[np.ndarr
             rows.append((name, row))
         if not rows:
             sys.exit("error_db has no rows matching the model's groups")
-        # Median fallback for unmatched groups.
+        # Median fallback for unmatched groups (params=0: excluded from the
+        # budget math; their bits are forced/defaulted downstream, e.g.
+        # routed experts get the uniform expert bitwidth).
         med_losses = np.median(
             np.array([[r["mse"][str(b)] for b in bitwidths] for _, r in rows], dtype=np.float64),
             axis=0,
         )
-        med_params = float(np.median([r["params"] for _, r in rows])) or 1.0
         filled = []
         row_map = dict(rows)
         for name in group_names:
             if name in row_map:
                 filled.append(row_map[name])
             else:
-                filled.append({"layer": name, "tensor": name, "params": med_params,
+                filled.append({"layer": name, "tensor": name, "params": 0,
                                "mse": {str(b): float(m) for b, m in zip(bitwidths, med_losses)}})
         rows = filled
 
@@ -900,10 +901,38 @@ def main():
             group_names = group_names[:n]
 
         # --- Step 3: allocation ---
+        # Collapse groups that share an identical loss row (e.g. every
+        # routed expert in one (layer, projection) shares its aggregate
+        # row) before the DP: budget_dp rounds each group's cost to an
+        # integer, so tens of thousands of tiny groups inflate the
+        # minimum feasible cost past the budget. Collapsing is exact --
+        # summed fracs, same options -- and assignment expands back.
         print(f"[3/5] RCO allocation  target={args.target_bpw} bpw ...")
-        assignment, report = run_rco_allocation(
-            losses, fracs, bitwidths, args.target_bpw, args.group_size, group_names
-        )
+        collapsed = {}
+        for i, name in enumerate(group_names):
+            collapsed.setdefault(losses[i].tobytes(), []).append(i)
+        if len(collapsed) < len(group_names):
+            print(f"  collapsing {len(group_names)} groups -> {len(collapsed)} unique loss rows")
+            c_losses, c_fracs, c_names, c_members = [], [], [], []
+            for members in collapsed.values():
+                c_losses.append(losses[members[0]])
+                c_fracs.append(fracs[members].sum())
+                c_names.append(group_names[members[0]])
+                c_members.append(members)
+            c_fracs = np.array(c_fracs, dtype=np.float64)
+            c_fracs = c_fracs / max(c_fracs.sum(), 1e-300)
+            c_assignment, report = run_rco_allocation(
+                np.array(c_losses), c_fracs, bitwidths, args.target_bpw,
+                args.group_size, c_names,
+            )
+            assignment = {
+                group_names[i]: c_assignment[c_names[j]]
+                for j, members in enumerate(c_members) for i in members
+            }
+        else:
+            assignment, report = run_rco_allocation(
+                losses, fracs, bitwidths, args.target_bpw, args.group_size, group_names
+            )
         print(f"  achieved {report['achieved_bpw']:.4f} bpw")
         print(f"  histogram: {report['bit_histogram']}")
 
