@@ -113,11 +113,10 @@ def build_error_db(
     use_gptq: bool = True,
 ) -> Path:
     """Build GPTQ-based error_db using the streaming two-phase approach."""
-    script = Path(__file__).parent.parent / "src" / "rco_mlx" / "scripts" / "build_moe_error_db.py"
+    script = Path(__file__).parent.parent / "scripts" / "build_error_db_perblock.py"
     cmd = [
         sys.executable, str(script),
         "--source", str(source_dir),
-        "--rtn-source", str(_auto_rtn_source(source_dir, bits=8, group_size=group_size)),
         "--output", str(output_path),
         "--model-type", model_adapter.model_type,
         "--calibration", str(calibration_path),
