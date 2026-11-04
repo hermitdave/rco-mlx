@@ -15,7 +15,7 @@ def compute_logits(model, ids):
     x = mx.array(ids)
     logits = model(x)
     mx.eval(logits)
-    return logits
+    return logits.astype(mx.float32)
 
 def ppl(logits, ids):
     logp = nn.log_softmax(logits[:, :-1, :], axis=-1)
@@ -49,7 +49,7 @@ def main():
     print("Loading BF16...")
     model, tok = load_model(args.bf16)
     logits_bf = compute_logits(model, ids)
-    np.save("/tmp/bench_logits_bf.npy", np.array(logits_bf, dtype=np.float32))
+    np.save("/tmp/bench_logits_bf.npy", np.array(logits_bf.tolist(), dtype=np.float32))
     ppl_bf = ppl(logits_bf, ids)
     print(f"BF16 PPL: {ppl_bf:.4f}")
     del model; mx.clear_cache(); gc.collect()
