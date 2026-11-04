@@ -15,11 +15,13 @@ know which model it is running on.
 from .base import ModelAdapter, get, register
 from .olmoe import OLMoEAdapter
 from .qwen3_5_moe import Qwen3NextMoEAdapter
+from .qwen4_exp import Qwen4ExpAdapter
 
 __all__ = [
     "ModelAdapter",
     "OLMoEAdapter",
     "Qwen3NextMoEAdapter",
+    "Qwen4ExpAdapter",
     "register",
     "get",
 ]

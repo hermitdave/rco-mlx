@@ -183,7 +183,14 @@ def run_rco_allocation(
     return assignment, report
 
 
-def load_error_db(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_error_db(path: Path, group_names: list | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load error DB, optionally aligned to ``group_names`` by module name.
+
+    When group_names is given, each group is matched to its error row by
+    name (stripping the ``.weight`` suffix); expert modules fall back to
+    their per-(layer, projection) aggregate row; anything unmatched gets
+    the median row (it will be forced to expert/default bits downstream).
+    """
     db = json.loads(path.read_text())
     if "layers" not in db:
         sys.exit(f"Not a valid error_db.json (no 'layers' key): {path}")
@@ -196,12 +203,56 @@ def load_error_db(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     })
     param_counts = db.get("param_counts", {})
 
-    rows = []
-    for layer_path, bw_data in db["layers"].items():
+    def _row(layer_path, bw_data):
         params = param_counts.get(layer_path, 0)
         mse = {str(bw): bw_data[str(bw)]["error"] for bw in bitwidths if str(bw) in bw_data}
-        rows.append({"layer": layer_path, "tensor": layer_path, "params": params, "mse": mse})
+        return {"layer": layer_path, "tensor": layer_path, "params": params, "mse": mse}
 
+    by_name = {}
+    for layer_path, bw_data in db["layers"].items():
+        by_name[layer_path] = _row(layer_path, bw_data)
+        by_name[layer_path.removesuffix(".weight")] = by_name[layer_path]
+
+    if group_names is None:
+        rows = []
+        seen = set()
+        for r in by_name.values():
+            if r["layer"] in seen:
+                continue
+            seen.add(r["layer"])
+            rows.append(r)
+    else:
+        import re as _re
+        rows = []
+        for name in group_names:
+            row = by_name.get(name) or by_name.get(name + ".weight")
+            if row is None:
+                m = _re.match(r"^(model\.language_model\.layers\.\d+\.mlp\.experts)\.\d+\.([a-z_]+)$", name)
+                if m:
+                    row = by_name.get(f"{m.group(1)}.{m.group(2)}")
+            if row is None:
+                continue  # unmatched (e.g. BF16-preserved): filled below
+            rows.append((name, row))
+        if not rows:
+            sys.exit("error_db has no rows matching the model's groups")
+        # Median fallback for unmatched groups.
+        med_losses = np.median(
+            np.array([[r["mse"][str(b)] for b in bitwidths] for _, r in rows], dtype=np.float64),
+            axis=0,
+        )
+        med_params = float(np.median([r["params"] for _, r in rows])) or 1.0
+        filled = []
+        row_map = dict(rows)
+        for name in group_names:
+            if name in row_map:
+                filled.append(row_map[name])
+            else:
+                filled.append({"layer": name, "tensor": name, "params": med_params,
+                               "mse": {str(b): float(m) for b, m in zip(bitwidths, med_losses)}})
+        rows = filled
+
+    # Drop rows with any missing bitwidth (should not happen with a fresh DB).
+    rows = [r for r in rows if all(str(b) in r["mse"] for b in bitwidths)]
     bitwidths_arr = np.array(bitwidths, dtype=np.int64)
     losses = np.array(
         [[r["mse"][str(b)] for b in bitwidths] for r in rows],
@@ -339,7 +390,8 @@ def stream_quantize(
                     return mapped_wo
         return mlx
 
-    def should_quantize(mlx_key: str) -> tuple[bool, int]:
+    def should_quantize(mlx_key: str) -> tuple[bool, int, int]:
+        gs = group_size
         if (
             "norm" in mlx_key
             or "embed" in mlx_key
@@ -349,11 +401,14 @@ def stream_quantize(
             or mlx_key.endswith(".bias")
             or ".conv.conv." in mlx_key
         ):
-            return False, 4
+            return False, 4, gs
         if model_adapter is not None:
+            # N-gram PLE table: uniform quantization at adapter-specified bits/group.
+            if hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
+                return True, model_adapter.ngram_quant_bits, model_adapter.ngram_group_size
             for prefix in model_adapter.non_quantized_prefixes():
                 if f".{prefix}." in f".{mlx_key}." or mlx_key.startswith(f"{prefix}.") or mlx_key == prefix:
-                    return False, 4
+                    return False, 4, gs
         bits = layer_bits_with_suffix.get(mlx_key)
         if bits is None:
             base = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
@@ -376,7 +431,7 @@ def stream_quantize(
                     pass
         if bits is None:
             bits = 4
-        return True, bits
+        return True, bits, gs
 
     shards = sorted(source_dir.glob("*.safetensors"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -393,13 +448,13 @@ def stream_quantize(
                     results[key] = f.get_tensor(key).to(torch.bfloat16)
                     continue
 
-                q_ok, bits = should_quantize(mlx_key)
+                q_ok, bits, q_gs = should_quantize(mlx_key)
                 if q_ok:
                     tensor = f.get_tensor(key)
                     if tensor.ndim == 2:
                         w = mx.array(tensor.float().numpy())
                         q, scales, biases = mx.quantize(
-                            w, bits=bits, group_size=group_size, mode=quant_mode
+                            w, bits=bits, group_size=q_gs, mode=quant_mode
                         )
                         mx.eval(q, scales, biases)
                         base_key = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
@@ -426,7 +481,7 @@ def stream_quantize(
                         flat = tensor.reshape(E * H, I)
                         w_flat = mx.array(flat.float().numpy())
                         q_flat, scales_flat, biases_flat = mx.quantize(
-                            w_flat, bits=bits, group_size=group_size, mode=quant_mode
+                            w_flat, bits=bits, group_size=q_gs, mode=quant_mode
                         )
                         mx.eval(q_flat, scales_flat, biases_flat)
                         q_stacked = np.array(q_flat).reshape(E, H, -1).astype(np.uint32)
@@ -540,7 +595,7 @@ def _rewrite_config_mlx_keys(output_dir: Path, model_adapter, quant_mode: str = 
 # MoE auto-detection
 # ---------------------------------------------------------------------------
 
-_MOE_ADAPTERS = {"olmoe", "qwen3_5_moe"}
+_MOE_ADAPTERS = {"olmoe", "qwen3_5_moe", "qwen4_exp"}
 
 
 def detect_moe_model(source_dir: Path, model_type: str | None) -> bool:
@@ -834,8 +889,8 @@ def main():
                 use_gptq=not args.no_gptq,
             )
 
-        # Load error_db for allocation
-        losses, fracs, bitwidths = load_error_db(error_db_path)
+        # Load error_db for allocation (name-aligned to groups)
+        losses, fracs, bitwidths = load_error_db(error_db_path, group_names=group_names)
         group_names = [g.layer_names[0] for g in groups]
         if losses.shape[0] != len(group_names):
             print(f"  warning: error_db has {losses.shape[0]} rows but {len(group_names)} groups")
