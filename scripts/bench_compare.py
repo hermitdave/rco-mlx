@@ -49,7 +49,7 @@ def main():
     print("Loading BF16...")
     model, tok = load_model(args.bf16)
     logits_bf = compute_logits(model, ids)
-    np.save("/tmp/bench_logits_bf.npy", np.array(logits_bf))
+    np.save("/tmp/bench_logits_bf.npy", np.array(logits_bf, dtype=np.float32))
     ppl_bf = ppl(logits_bf, ids)
     print(f"BF16 PPL: {ppl_bf:.4f}")
     del model; mx.clear_cache(); gc.collect()
