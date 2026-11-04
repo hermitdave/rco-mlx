@@ -318,9 +318,10 @@ def _is_quantizable(path: str) -> bool:
     check = path if path.endswith(".weight") else path + ".weight"
     if "norm" in check or "embed" in check or "lm_head" in check or "mtp" in check:
         return False
-    # Routed-expert gate_proj IS quantizable (it stacks into the fused
-    # switch_mlp); only standalone gate projections are excluded.
-    if check.endswith(".gate_proj.weight") and ".experts." not in check:
+    # Only the MoE router gate is excluded (mlx_lm has no QuantizedLinear
+    # for it). Routed-expert and shared-expert gate_proj projections ARE
+    # quantizable (qwen4_exp stacks them into switch_mlp / standard MLP).
+    if check.endswith(".mlp.gate.weight") or check.endswith(".switch_mlp.gate.weight"):
         return False
     return check.endswith(".weight")
 
