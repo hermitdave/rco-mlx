@@ -452,6 +452,14 @@ def stream_quantize(
                 q_ok, bits, q_gs = should_quantize(mlx_key)
                 if q_ok:
                     tensor = f.get_tensor(key)
+                    # mx.quantize requires the last dim to be divisible by
+                    # the group size (e.g. ple.conv1d is 10240x1x4). Keep
+                    # such tensors BF16 rather than crashing the whole run.
+                    if tensor.shape[-1] % q_gs != 0:
+                        print(f"  {mlx_key}: last dim {tensor.shape[-1]} not divisible "
+                              f"by group {q_gs} -> keeping BF16")
+                        results[key] = tensor.to(torch.bfloat16)
+                        continue
                     if tensor.ndim == 2:
                         w = mx.array(tensor.float().numpy())
                         q, scales, biases = mx.quantize(
@@ -515,8 +523,19 @@ def stream_quantize(
                 else:
                     results[key] = f.get_tensor(key).to(torch.bfloat16)
 
+        # N-gram PLE tensors go into their own file(s) so the lookup
+        # table (tens of GB) can be moved / kept on host SSD separately
+        # from the main checkpoint. mlx_lm loads every *.safetensors in
+        # the directory, so this is transparent at load time.
+        ngram_results = {
+            k: results.pop(k) for k in list(results) if "ngram_embedding" in k
+        }
         out_shard = output_dir / f"model-{i+1:05d}-of-{len(shards):05d}.safetensors"
         save_file(results, str(out_shard))
+        if ngram_results:
+            ngram_shard = output_dir / f"ngram-{i+1:05d}-of-{len(shards):05d}.safetensors"
+            save_file(ngram_results, str(ngram_shard))
+            print(f"  n-gram -> {ngram_shard.name} ({len(ngram_results)} tensors)")
         total_tensors += len(results)
         elapsed = time.time() - start
         print(f"  saved {len(results)} tensors | {elapsed:.1f}s elapsed")

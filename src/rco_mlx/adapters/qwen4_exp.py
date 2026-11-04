@@ -42,7 +42,7 @@ class Qwen4ExpAdapter(ModelAdapter):
     _BF16_PREFIXES = (
         "mlp.gate",
         "conv.conv",
-        "linear_attn.conv1d",
+        "conv1d",
         "visual",
         "mtp",
     )
