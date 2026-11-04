@@ -45,7 +45,6 @@ def measure_layer_errors(weight_bf16, bitwidths, group_size=64):
     errors = {}
     w = weight_bf16.astype(mx.float32)
     for bw in bitwidths:
-        # Simple per-channel quantization at bw bits
         qmax = (1 << (bw - 1)) - 1
         scale = mx.abs(w).max(axis=0) / qmax
         scale = mx.where(scale == 0, mx.ones_like(scale), scale)
