@@ -393,6 +393,10 @@ def stream_quantize(
 
     def should_quantize(mlx_key: str) -> tuple[bool, int, int]:
         gs = group_size
+        # N-gram PLE table first: its name contains "embed", which the
+        # generic exclusion below would incorrectly match.
+        if model_adapter is not None and hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
+            return True, model_adapter.ngram_quant_bits, model_adapter.ngram_group_size
         if (
             "norm" in mlx_key
             or "embed" in mlx_key
