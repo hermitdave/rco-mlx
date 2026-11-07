@@ -110,9 +110,19 @@ def test_budget_dp_rejects_bad_shapes():
 
 
 def test_budget_dp_rejects_non_finite_values():
+    # NaN is rejected; -inf is the documented "forbidden option" marker and
+    # must be accepted (see mask_values_below_min_bits in expert_alloc).
     values = np.array([[0.0, np.nan], [0.0, 1.0]])
-    with pytest.raises(ValueError, match="non-finite"):
+    with pytest.raises(ValueError, match="NaN"):
         budget_dp(values, np.array([0.5, 0.5]), np.array([2.0, 4.0]), 3.0)
+
+    idx = budget_dp(
+        np.array([[0.0, -np.inf], [0.0, 1.0]]),
+        np.array([0.5, 0.5]),
+        np.array([2.0, 4.0]),
+        3.0,
+    )
+    assert idx[0] == 0  # -inf option never chosen
 
 
 def test_values_from_losses_sign_and_order():

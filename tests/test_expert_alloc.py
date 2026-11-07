@@ -11,8 +11,12 @@ from rco_mlx.expert_alloc import (
     fill_missing_expert_groups,
     gguf_recipe_bits,
     is_expert_name,
+    mask_values_below_min_bits,
     uniform_expert_bits,
 )
+from rco_mlx.search import budget_dp
+
+import numpy as np
 
 HF_GATE = "model.language_model.layers.{l}.mlp.experts.{e}.gate_up_proj"
 HF_DOWN = "model.language_model.layers.{l}.mlp.experts.{e}.down_proj"
@@ -110,3 +114,39 @@ def test_apply_gguf_recipe_overrides_only_experts():
     assert out[names[3]] == 8  # attention untouched
     with pytest.raises(ValueError):
         apply_gguf_recipe(assignment, names, model_type="olmoe")
+
+
+def test_min_bits_mask_forbids_only_expert_groups():
+    values = np.array([[-1.0, -2.0, -3.0], [-1.0, -2.0, -3.0]])
+    masked = mask_values_below_min_bits(values, [2, 3, 4], [True, False], min_bits=3)
+    assert np.isneginf(masked[0, 0])
+    assert masked[0, 1:] .tolist() == [-2.0, -3.0]
+    assert masked[1].tolist() == [-1.0, -2.0, -3.0]  # non-expert untouched
+    # no-op when the floor is at or below the smallest option
+    assert mask_values_below_min_bits(values, [2, 3, 4], [True, True], 2).tolist() == values.tolist()
+
+
+def test_min_bits_dp_compensates_via_attention():
+    # One expert group (90% of params, loves 2-bit) + one attention group
+    # (10%, hates 2-bit). Unconstrained DP at a tight budget must give the
+    # expert 2-bit; with a 3-bit floor it must instead drop attention.
+    bitwidths = np.array([2, 3, 4, 8])
+    actual = bitwidths + 0.25  # gs64 effective, pipeline convention
+    losses = np.array([
+        [0.10, 0.11, 0.12, 0.13],   # expert: nearly flat -> wants 2-bit
+        [10.0, 1.0, 0.1, 0.01],     # attention: steep -> wants 8-bit
+    ])
+    fracs = np.array([0.9, 0.1])
+    values = -losses
+
+    idx = budget_dp(values, fracs, actual, target_avg_bits=2.9, resolution=1000)
+    assert bitwidths[idx[0]] == 2  # unconstrained: expert at 2-bit
+
+    masked = mask_values_below_min_bits(values, bitwidths, [True, False], min_bits=3)
+    idx_f = budget_dp(masked, fracs, actual, target_avg_bits=3.3, resolution=1000)
+    assert bitwidths[idx_f[0]] >= 3  # floor respected
+    assert bitwidths[idx_f[1]] < bitwidths[idx[1]]  # attention pays for it
+
+    # Infeasible floor+target must surface as the DP's error, not a silent act
+    with pytest.raises(ValueError):
+        budget_dp(masked, fracs, actual, target_avg_bits=3.0, resolution=1000)

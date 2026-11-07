@@ -91,8 +91,10 @@ def budget_dp(
         raise ValueError(f"fracs must be ({n_groups},), got {fracs.shape}")
     if actual_bits.shape != (n_options,):
         raise ValueError(f"actual_bits must be ({n_options},), got {actual_bits.shape}")
-    if not np.isfinite(values).all():
-        raise ValueError("values contains non-finite entries")
+    if np.isnan(values).any():
+        raise ValueError("values contains NaN entries")
+    # -inf is the documented way to forbid an option for a group (higher is
+    # better, so -inf is never chosen while any finite option is reachable).
 
     budget = int(round(target_avg_bits * resolution))
     if budget <= 0:
@@ -113,6 +115,8 @@ def budget_dp(
             if c > budget:
                 continue
             v = values[g, k]
+            if not np.isfinite(v):
+                continue  # forbidden option (masked with -inf)
             cand = dp[: budget + 1 - c] + v
             seg = new_dp[c:]
             better = cand > seg

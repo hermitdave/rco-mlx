@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 __all__ = [
     "is_expert_name",
@@ -42,6 +44,7 @@ __all__ = [
     "uniform_expert_bits",
     "gguf_recipe_bits",
     "apply_gguf_recipe",
+    "mask_values_below_min_bits",
     "GGUF_GATE_UP_XXS_LAYERS",
     "GGUF_DOWN_IQ4_LAYERS",
     "GGUF_DOWN_225_LAYERS",
@@ -268,3 +271,36 @@ def apply_gguf_recipe(
             new_assignment[name] = bits
             n_overridden += 1
     return new_assignment, n_overridden
+
+
+def mask_values_below_min_bits(
+    values: np.ndarray,
+    bitwidths: Sequence[int] | np.ndarray,
+    group_is_expert: Sequence[bool],
+    min_bits: int,
+) -> np.ndarray:
+    """Forbid expert groups from choosing options below ``min_bits`` in the DP.
+
+    Returns a copy of the value table with ``-inf`` in every disallowed
+    (expert group, option) cell. Unlike a post-hoc override, masking before
+    ``budget_dp`` keeps the assignment budget-feasible: the DP compensates
+    for the more expensive experts by lowering non-expert widths. If even
+    the cheapest allowed option set exceeds the target, ``budget_dp``
+    raises its infeasibility error -- the correct signal that the floor
+    and the target are incompatible.
+    """
+    values_arr = np.asarray(values, dtype=np.float64)
+    widths = np.asarray(bitwidths)
+    if values_arr.ndim != 2 or values_arr.shape[0] != len(group_is_expert):
+        raise ValueError(
+            f"values must be (n_groups, n_options) with n_groups == "
+            f"len(group_is_expert); got {values_arr.shape} vs {len(group_is_expert)}"
+        )
+    masked = values_arr.copy()
+    if min_bits <= int(widths.min()):
+        return masked
+    disallowed = widths < min_bits
+    for g, is_expert in enumerate(group_is_expert):
+        if is_expert:
+            masked[g, disallowed] = -np.inf
+    return masked

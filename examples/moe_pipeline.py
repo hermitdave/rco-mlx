@@ -50,6 +50,7 @@ from rco_mlx.expert_alloc import (
     enforce_group_uniformity,
     expert_group_key,
     fill_missing_expert_groups,
+    mask_values_below_min_bits,
     uniform_expert_bits,
 )
 
@@ -177,6 +178,8 @@ def run_rco_allocation(
     target_bpw: float,
     group_size: int,
     group_names: list[str],
+    expert_min_bits: int = 2,
+    group_is_expert: list[bool] | None = None,
 ) -> tuple[dict[str, int], dict]:
     table = LossTable(
         losses=losses,
@@ -184,9 +187,31 @@ def run_rco_allocation(
         bitwidths=bitwidths,
         group_size=group_size,
     )
-    report = table.report(target_avg_bits=target_bpw)
-    bits_per_group = table.assignment(target_avg_bits=target_bpw)
+    values = table.values()
+    if expert_min_bits > int(bitwidths.min()):
+        if group_is_expert is None:
+            sys.exit("--expert-min-bits requires expert group flags")
+        values = mask_values_below_min_bits(
+            values, bitwidths, group_is_expert, expert_min_bits
+        )
+        print(f"  expert floor: {expert_min_bits}-bit minimum enforced in DP "
+              f"({sum(group_is_expert)} expert groups)")
+    idx = budget_dp(
+        values, table.fracs, table.actual_bits(), target_bpw, resolution=10000
+    )
+    bits_per_group = table.bitwidths[idx]
     assignment = {name: int(b) for name, b in zip(group_names, bits_per_group)}
+    report = {
+        "target_bpw": float(target_bpw),
+        "achieved_bpw": table.achieved_bpw(bits_per_group),
+        "n_groups": table.n_groups,
+        "bit_histogram": {
+            int(b): int((bits_per_group == b).sum())
+            for b in sorted(set(bits_per_group.tolist()))
+        },
+        "group_size": group_size,
+        "transform": table.transform,
+    }
     return assignment, report
 
 
@@ -747,6 +772,12 @@ def main():
                          "uniformity only within each (layer, projection) stacked "
                          "tensor; 'gguf-recipe' overrides experts with the measured "
                          "UD-IQ2_XS per-layer recipe (qwen4_exp, 48 layers only)")
+    ap.add_argument("--expert-min-bits", type=int, default=2,
+                    help="Minimum bitwidth for routed experts, enforced inside the "
+                         "DP (per-projection mode only): expert groups may only "
+                         "choose options >= this width and the DP compensates by "
+                         "lowering non-expert widths. 2 = no floor (default). "
+                         "Note: a floor can make a low target infeasible.")
     ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
     ap.add_argument("--batch-size", type=int, default=4, help="Calibration batch size")
 
@@ -965,6 +996,13 @@ def main():
             c_assignment, report = run_rco_allocation(
                 np.array(c_losses), c_fracs, bitwidths, args.target_bpw,
                 args.group_size, c_names,
+                expert_min_bits=(
+                    args.expert_min_bits
+                    if args.expert_allocation == "per-projection" else 2
+                ),
+                group_is_expert=[
+                    expert_group_key(n) is not None for n in c_names
+                ],
             )
             assignment = {
                 group_names[i]: c_assignment[c_names[j]]
@@ -972,7 +1010,14 @@ def main():
             }
         else:
             assignment, report = run_rco_allocation(
-                losses, fracs, bitwidths, args.target_bpw, args.group_size, group_names
+                losses, fracs, bitwidths, args.target_bpw, args.group_size, group_names,
+                expert_min_bits=(
+                    args.expert_min_bits
+                    if args.expert_allocation == "per-projection" else 2
+                ),
+                group_is_expert=[
+                    expert_group_key(n) is not None for n in group_names
+                ],
             )
         print(f"  achieved {report['achieved_bpw']:.4f} bpw")
         print(f"  histogram: {report['bit_histogram']}")
