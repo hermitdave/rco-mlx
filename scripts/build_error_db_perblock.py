@@ -51,16 +51,24 @@ def expert_row_key(key: str):
     return None
 
 
-def rtn_errors(w: np.ndarray, bitwidths, col_weights=None, clip_search: bool = False) -> dict:
-    """Per-column-scale RTN MSE at each bitwidth.
+def rtn_errors(w: np.ndarray, bitwidths, col_weights=None, clip_search: bool = False,
+               group_size: int = 64) -> dict:
+    """Per-group RTN MSE at each bitwidth, mirroring MLX affine grouping.
+
+    Scales are computed per output row and per ``group_size`` block along
+    the input dimension -- the same grouping ``mx.quantize`` uses -- not
+    per column. (A per-column model systematically underestimates the
+    damage of low-bit quantization, and any clip ratio tuned under it
+    does not transfer: a column-max over 2048 rows is far larger than a
+    64-sample group-max, so saturating 40% of that range is mild in one
+    model and destructive in the other.)
 
     ``col_weights`` (per input column, mean-1) turn the plain MSE into an
-    activation-weighted one: columns that see large activations count
-    more, matching the diagonal-Hessian objective an imatrix encodes.
-    ``clip_search`` also sweeps per-column scale multipliers below the
-    max-abs scale and keeps the MSE-optimal one per bitwidth (recorded
-    under ``"clip"``); this is a scale search in the builder's symmetric
-    RTN model, and the recorded clip is applied at quantize time.
+    activation-weighted one, matching the diagonal-Hessian objective an
+    imatrix encodes. ``clip_search`` also sweeps per-group scale
+    multipliers below the max-abs scale and keeps the MSE-optimal one
+    per bitwidth (recorded under ``"clip"``), with grid saturation
+    modelled so the search transfers to the real quantizer.
     """
     out = {}
     flat = w.astype(np.float32, copy=False)
@@ -75,22 +83,31 @@ def rtn_errors(w: np.ndarray, bitwidths, col_weights=None, clip_search: bool = F
             return {str(bw): {"error": 0.0, "clip": 1.0} for bw in bitwidths}
     else:
         cw = None
-    clips = (1.0, 0.9, 0.8, 0.7, 0.6) if clip_search else (1.0,)
-    max_abs = np.abs(flat).max(axis=0)
+    # Mild clips only: per-group saturation at 0.6-0.8 crushes ~5-9% of
+    # weights per group, which weight-MSE (a linear proxy) tolerates but
+    # softmax/router nonlinearities may not -- measured catastrophic on
+    # OLMoE at 0.6 despite a better proxy error. Cap the search at 0.9.
+    clips = (1.0, 0.95, 0.9) if clip_search else (1.0,)
+    gs = group_size
+    if flat.shape[1] % gs != 0:
+        gs = flat.shape[1]  # single group per row: fall back to whole-row scale
+    grouped = flat.reshape(flat.shape[0], -1, gs)
+    max_abs = np.abs(grouped).max(axis=-1)  # [out, groups]
+    if cw is not None:
+        cw_g = cw.reshape(-1, gs)  # [groups, gs], tiled per row below
     for bw in bitwidths:
         qmax = float((1 << (bw - 1)) - 1)
         best_err, best_clip = None, 1.0
         for clip in clips:
-            scale = max_abs * clip / qmax
+            scale = max_abs * clip / qmax  # [out, groups]
             scale = np.where(scale == 0, 1.0, scale)
-            # Saturate to the grid: real quantizers cannot represent values
-            # beyond +-qmax, so a clip that only looks good without
-            # saturation (huge outlier error at quantize time) must not
-            # win the search here either.
-            w_q = np.clip(np.round(flat / scale), -qmax, qmax) * scale
-            sq = (flat - w_q) ** 2
+            w_q = np.clip(
+                np.round(grouped / scale[:, :, None]), -qmax, qmax
+            ) * scale[:, :, None]
+            sq = (grouped - w_q) ** 2  # [out, groups, gs]
             if cw is not None:
-                err = float((sq.mean(axis=0) * cw).sum() / cw.sum())
+                # Weighted mean over columns, then over all elements.
+                err = float((sq * cw_g[None, :, :]).sum() / cw_g.sum() / flat.shape[0])
             else:
                 err = float(sq.mean())
             if best_err is None or err < best_err:
@@ -203,7 +220,8 @@ def main():
                     if mapped is not None:
                         col_w, route_w = mapped
                 errs = rtn_errors(w, bitwidths, col_weights=col_w,
-                                  clip_search=args.clip_search)
+                                  clip_search=args.clip_search,
+                                  group_size=args.group_size)
                 del w
                 row = expert_row_key(key)
                 if row is not None:
