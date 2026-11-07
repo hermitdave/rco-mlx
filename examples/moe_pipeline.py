@@ -119,6 +119,8 @@ def build_error_db(
     batch_size: int = 4,
     quant_mode: str = "affine",
     use_gptq: bool = True,
+    imatrix_path: Path | None = None,
+    clip_search: bool = False,
 ) -> Path:
     """Build GPTQ-based error_db using the streaming two-phase approach."""
     script = Path(__file__).parent.parent / "scripts" / "build_error_db_perblock.py"
@@ -137,6 +139,10 @@ def build_error_db(
         cmd.append("--use-gptq")
     else:
         cmd.append("--no-gptq")
+    if imatrix_path:
+        cmd += ["--imatrix", str(imatrix_path)]
+    if clip_search:
+        cmd.append("--clip-search")
 
     print(f"[2/5] building error_db: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -296,6 +302,105 @@ def load_error_db(path: Path, group_names: list | None = None) -> tuple[np.ndarr
     return losses, fracs, bitwidths_arr
 
 
+def load_clip_map(
+    error_db_path: Path, assignment: dict[str, int]
+) -> dict[str, float]:
+    """Resolve per-group clip ratios from the DB's ``clips`` table.
+
+    Keys mirror ``load_error_db`` alignment: direct name, ``+.weight``, or
+    the per-(layer, projection) expert aggregate. Groups without a clip
+    entry get 1.0 (no clipping).
+    """
+    try:
+        db = json.loads(Path(error_db_path).read_text())
+    except Exception:
+        return {}
+    clips = db.get("clips", {})
+    if not clips:
+        return {}
+    import re as _re
+
+    out: dict[str, float] = {}
+    for name, bits in assignment.items():
+        row = clips.get(name) or clips.get(name + ".weight")
+        if row is None:
+            m = _re.match(
+                r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.mlp\.experts)"
+                r"\.\d+\.([a-z_]+)$",
+                name,
+            )
+            if m:
+                row = clips.get(f"{m.group(1)}.{m.group(2)}")
+        if row is not None:
+            out[name] = float(row.get(str(int(bits)), 1.0))
+    return out
+
+
+def resolve_imatrix(args, source: Path, output: Path) -> Path | None:
+    """Resolve an imatrix path: explicit > HF download > local build > none.
+
+    Order follows the user's preference: a published imatrix on HF is
+    always preferred over building one; a local build only happens when
+    the BF16 source fits in memory (or with --force via the capture
+    script's own gate).
+    """
+    from rco_mlx.imatrix import (
+        download_imatrix,
+        find_imatrix_on_hf,
+        fits_in_memory,
+    )
+
+    if args.imatrix:
+        path = Path(args.imatrix).expanduser().resolve()
+        if not path.exists():
+            sys.exit(f"--imatrix file not found: {path}")
+        print(f"Using local imatrix: {path}")
+        return path
+
+    work = output / "work"
+    work.mkdir(parents=True, exist_ok=True)
+
+    if args.imatrix_repo:
+        filename = find_imatrix_on_hf(args.imatrix_repo, args.imatrix_filename)
+        if filename:
+            print(f"Found imatrix on HF: {args.imatrix_repo}/{filename} "
+                  f"-- downloading...")
+            return download_imatrix(args.imatrix_repo, filename, work)
+        print(f"No imatrix found in HF repo {args.imatrix_repo} "
+              f"({args.imatrix_filename or 'any *imatrix* file'})")
+
+    if args.build_imatrix:
+        fits, model_bytes, ram = fits_in_memory(source)
+        print(f"Local imatrix build gate: model {model_bytes/1e9:.1f} GB, "
+              f"RAM {ram/1e9:.1f} GB, fits={fits}")
+        if not fits:
+            sys.exit(
+                "BF16 source does not fit in memory for a local imatrix "
+                "capture (70% RAM gate). Use a published imatrix via "
+                "--imatrix-repo, or run on a larger machine."
+            )
+        capture = (
+            Path(__file__).parent.parent / "scripts" / "capture_imatrix.py"
+        )
+        imatrix_path = work / "imatrix.npz"
+        cmd = [
+            sys.executable, str(capture),
+            "--source", str(source),
+            "--calibration", str(work / "calib.npy"),
+            "--output", str(imatrix_path),
+        ]
+        print(f"Building local imatrix: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.exit(f"imatrix capture failed:\n{result.stderr}")
+        print(result.stdout)
+        return imatrix_path
+
+    if args.imatrix_repo or args.build_imatrix:
+        print("Proceeding without an imatrix (unweighted error DB).")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Step 4: emit + validate config
 # ---------------------------------------------------------------------------
@@ -308,6 +413,7 @@ def emit_and_validate(
     default_bits: int = 4,
     quant_mode: str = "affine",
     bf16_prefixes: list[str] | None = None,
+    group_size_map: dict[str, int] | None = None,
 ) -> MlxQuantConfig:
     filtered = assignment
     if bf16_prefixes:
@@ -319,6 +425,7 @@ def emit_and_validate(
         default_bits=default_bits,
         group_size=group_size,
         mode=quant_mode,
+        group_size_map=group_size_map,
     )
 
     base_cfg_path = source_dir / "config.json"
@@ -387,22 +494,69 @@ def stream_quantize(
     group_size: int,
     model_adapter=None,
     quant_mode: str = "affine",
+    group_size_map: dict[str, int] | None = None,
+    clip_map: dict[str, float] | None = None,
 ):
     """Stream through BF16 source, quantize per allocation, write shards."""
     import torch
 
     from rco_mlx.mlx_alloc import MlxQuantConfig
 
-    cfg = allocation_to_config(assignment, group_size=group_size, mode=quant_mode)
+    cfg = allocation_to_config(
+        assignment, group_size=group_size, mode=quant_mode,
+        group_size_map=group_size_map,
+    )
     layer_bits = {}
+    layer_gs: dict[str, int] = {}
+    layer_clip: dict[str, float] = {}
     for path, bits in assignment.items():
         clean = path.removesuffix(".weight")
         layer_bits[clean] = bits
+        if group_size_map:
+            gs = group_size_map.get(path) or group_size_map.get(clean)
+            if gs:
+                layer_gs[clean] = int(gs)
+        if clip_map:
+            clip = clip_map.get(path) or clip_map.get(clean)
+            if clip:
+                layer_clip[clean] = float(clip)
         if model_adapter is not None:
             mlx = model_adapter.map_key_to_mlx(path)
             if mlx:
                 layer_bits[mlx.removesuffix(".weight")] = bits
                 layer_bits[mlx] = bits
+                if mlx.removesuffix(".weight") in layer_gs:
+                    layer_gs[mlx] = layer_gs[mlx.removesuffix(".weight")]
+                if mlx.removesuffix(".weight") in layer_clip:
+                    layer_clip[mlx] = layer_clip[mlx.removesuffix(".weight")]
+
+    def _apply_clip(w_np: np.ndarray, gs: int, clip: float) -> np.ndarray:
+        """Clamp per-group magnitudes at clip * group-max before quantizing.
+
+        mx.quantize derives its scale/bias from the clamped tensor's
+        range, so clamping first is exactly the saturation behaviour the
+        error-DB clip search measured.
+        """
+        if clip >= 1.0 or w_np.shape[-1] % gs != 0:
+            return w_np
+        orig = w_np.shape
+        grouped = w_np.reshape(*orig[:-1], -1, gs)
+        max_abs = np.abs(grouped).max(axis=-1, keepdims=True)
+        grouped = np.clip(grouped, -clip * max_abs, clip * max_abs)
+        return grouped.reshape(orig)
+
+    def _lookup_clip(base: str) -> float:
+        if base in layer_clip:
+            return layer_clip[base]
+        if ".experts." in base:
+            import re as _re
+
+            m = _re.match(r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.mlp\.experts)\.\d+\.([a-z_]+)$", base)
+            if m:
+                agg = f"{m.group(1)}.{m.group(2)}"
+                if agg in (clip_map or {}):
+                    return float(clip_map[agg])
+        return 1.0
 
     layer_bits_with_suffix = {}
     for path, bits in assignment.items():
@@ -426,12 +580,12 @@ def stream_quantize(
                     return mapped_wo
         return mlx
 
-    def should_quantize(mlx_key: str) -> tuple[bool, int, int]:
+    def should_quantize(mlx_key: str) -> tuple[bool, int, int, float]:
         gs = group_size
         # N-gram PLE table first: its name contains "embed", which the
         # generic exclusion below would incorrectly match.
         if model_adapter is not None and hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
-            return True, model_adapter.ngram_quant_bits, model_adapter.ngram_group_size
+            return True, model_adapter.ngram_quant_bits, model_adapter.ngram_group_size, 1.0
         if (
             "norm" in mlx_key
             or "embed" in mlx_key
@@ -441,14 +595,14 @@ def stream_quantize(
             or mlx_key.endswith(".bias")
             or ".conv.conv." in mlx_key
         ):
-            return False, 4, gs
+            return False, 4, gs, 1.0
         if model_adapter is not None:
             # N-gram PLE table: uniform quantization at adapter-specified bits/group.
             if hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
-                return True, model_adapter.ngram_quant_bits, model_adapter.ngram_group_size
+                return True, model_adapter.ngram_quant_bits, model_adapter.ngram_group_size, 1.0
             for prefix in model_adapter.non_quantized_prefixes():
                 if f".{prefix}." in f".{mlx_key}." or mlx_key.startswith(f"{prefix}.") or mlx_key == prefix:
-                    return False, 4, gs
+                    return False, 4, gs, 1.0
         bits = layer_bits_with_suffix.get(mlx_key)
         if bits is None:
             base = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
@@ -471,7 +625,8 @@ def stream_quantize(
                     pass
         if bits is None:
             bits = 4
-        return True, bits, gs
+        base = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
+        return True, bits, layer_gs.get(base, gs), _lookup_clip(base)
 
     shards = sorted(source_dir.glob("*.safetensors"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -488,19 +643,24 @@ def stream_quantize(
                     results[key] = f.get_tensor(key).to(torch.bfloat16)
                     continue
 
-                q_ok, bits, q_gs = should_quantize(mlx_key)
+                q_ok, bits, q_gs, q_clip = should_quantize(mlx_key)
                 if q_ok:
                     tensor = f.get_tensor(key)
                     # mx.quantize requires the last dim to be divisible by
                     # the group size (e.g. ple.conv1d is 10240x1x4). Keep
                     # such tensors BF16 rather than crashing the whole run.
+                    # (Per-tensor gs32/gs128 assignments must divide the
+                    # last dim -- true for all standard MoE widths; the
+                    # post-quantize config rewrite drops BF16 fallbacks
+                    # from the quantization map, so this stays loadable.)
                     if tensor.shape[-1] % q_gs != 0:
                         print(f"  {mlx_key}: last dim {tensor.shape[-1]} not divisible "
                               f"by group {q_gs} -> keeping BF16")
                         results[key] = tensor.to(torch.bfloat16)
                         continue
                     if tensor.ndim == 2:
-                        w = mx.array(tensor.float().numpy())
+                        w_np = _apply_clip(tensor.float().numpy(), q_gs, q_clip)
+                        w = mx.array(w_np)
                         q, scales, biases = mx.quantize(
                             w, bits=bits, group_size=q_gs, mode=quant_mode
                         )
@@ -527,7 +687,8 @@ def stream_quantize(
                         # Stacked MoE expert tensor: quantize ALL experts in batch
                         E, H, I = tensor.shape
                         flat = tensor.reshape(E * H, I)
-                        w_flat = mx.array(flat.float().numpy())
+                        w_flat_np = _apply_clip(flat.float().numpy(), q_gs, q_clip)
+                        w_flat = mx.array(w_flat_np)
                         q_flat, scales_flat, biases_flat = mx.quantize(
                             w_flat, bits=bits, group_size=q_gs, mode=quant_mode
                         )
@@ -778,6 +939,25 @@ def main():
                          "choose options >= this width and the DP compensates by "
                          "lowering non-expert widths. 2 = no floor (default). "
                          "Note: a floor can make a low target infeasible.")
+    ap.add_argument("--imatrix", default=None,
+                    help="Path to a GGUF imatrix file or local .npz; weights the "
+                         "error DB per input column by activation importance")
+    ap.add_argument("--imatrix-repo", default=None,
+                    help="HF repo to check for a published imatrix first "
+                         "(preferred over building one locally)")
+    ap.add_argument("--imatrix-filename", default=None,
+                    help="Exact imatrix filename in --imatrix-repo (default: any "
+                         "*imatrix* file)")
+    ap.add_argument("--build-imatrix", action="store_true",
+                    help="Capture a local imatrix via forward pass when the BF16 "
+                         "source fits in memory (70 percent RAM gate)")
+    ap.add_argument("--clip-search", action="store_true",
+                    help="Sweep per-tensor scale multipliers in the error DB "
+                         "and apply the recorded clip at quantize time")
+    ap.add_argument("--per-tensor-group-size", action="store_true",
+                    help="Assign per-tensor group sizes from measured "
+                         "sensitivity (top-quartile -> gs32, bottom-half -> "
+                         "gs128, else gs64)")
     ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
     ap.add_argument("--batch-size", type=int, default=4, help="Calibration batch size")
 
@@ -951,6 +1131,7 @@ def main():
 
             error_db_path = output / "work" / "error_db.json"
             error_db_path.parent.mkdir(parents=True, exist_ok=True)
+            imatrix_path = resolve_imatrix(args, source, output)
             build_error_db(
                 source_dir=source,
                 output_path=error_db_path,
@@ -960,6 +1141,8 @@ def main():
                 group_size=args.group_size,
                 quant_mode=args.quant_mode,
                 use_gptq=not args.no_gptq,
+                imatrix_path=imatrix_path,
+                clip_search=args.clip_search,
             )
 
         # Load error_db for allocation (name-aligned to groups)
@@ -1092,9 +1275,40 @@ def main():
     # --- Step 4: emit + validate ---
     print("[4/5] emitting MLX config + validating …")
     bf16_prefixes = model_adapter.non_quantized_prefixes() if model_adapter else None
+
+    # Per-tensor group sizes from measured sensitivity at the assigned
+    # bitwidth: top-quartile loss -> gs32, bottom-half -> gs128, else gs64.
+    group_size_map: dict[str, int] = {}
+    if args.per_tensor_group_size and not args.ad_ladder:
+        try:
+            sens = []
+            for i, name in enumerate(group_names):
+                bits = assignment.get(name)
+                if bits is None:
+                    continue
+                opt = list(bitwidths).index(int(bits)) if int(bits) in list(bitwidths) else None
+                if opt is not None:
+                    sens.append((name, float(losses[i, opt])))
+            if sens:
+                vals = np.array([v for _, v in sens])
+                hi, lo = np.quantile(vals, 0.75), np.quantile(vals, 0.5)
+                for name, v in sens:
+                    group_size_map[name] = 32 if v >= hi else (128 if v <= lo else 64)
+                print(f"  per-tensor group sizes: {dict(Counter(group_size_map.values()))}")
+        except Exception as exc:
+            print(f"  per-tensor group size skipped ({exc}); using gs{args.group_size}")
+
+    clip_map: dict[str, float] = {}
+    if not args.ad_ladder and error_db_path.exists():
+        clip_map = load_clip_map(error_db_path, assignment)
+        if clip_map:
+            print(f"  clip map: {len(clip_map)} tensors "
+                  f"(range {min(clip_map.values()):.2f}-{max(clip_map.values()):.2f})")
+
     cfg = emit_and_validate(
         assignment, args.group_size, source, output, args.default_bits,
         quant_mode=args.quant_mode, bf16_prefixes=bf16_prefixes,
+        group_size_map=group_size_map or None,
     )
 
     # --- Step 5: quantize ---
@@ -1106,6 +1320,7 @@ def main():
     stream_quantize(
         source, output, assignment, args.group_size,
         model_adapter=model_adapter, quant_mode=args.quant_mode,
+        group_size_map=group_size_map or None, clip_map=clip_map or None,
     )
 
     # Post-process: apply Qwen3.5 sanitize for quantized weights

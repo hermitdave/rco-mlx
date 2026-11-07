@@ -123,16 +123,24 @@ def allocation_to_config(
     default_bits: int = 4,
     group_size: int = 64,
     mode: str = "affine",
+    group_size_map: Optional[Mapping[str, int]] = None,
 ) -> MlxQuantConfig:
     """Build an ``MlxQuantConfig`` from a ``{module_path: bits}`` assignment.
 
     Modules already at ``default_bits`` are still listed explicitly -- the
     loader's default fallback cannot distinguish "intentionally 4-bit" from
     "I forgot this one", so an explicit entry is the only unambiguous form.
+    ``group_size_map`` optionally overrides the group size per module path
+    (per-tensor group sizing: sensitive tensors get finer groups).
     """
     cfg = MlxQuantConfig(default_bits=default_bits, group_size=group_size, mode=mode)
     for module_path, bits in sorted(assignment.items()):
-        cfg.set(module_path, bits)
+        gs = None
+        if group_size_map:
+            gs = group_size_map.get(module_path) or group_size_map.get(
+                module_path.removesuffix(".weight")
+            )
+        cfg.set(module_path, bits, group_size=gs)
     return cfg
 
 

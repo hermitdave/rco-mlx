@@ -51,17 +51,47 @@ def expert_row_key(key: str):
     return None
 
 
-def rtn_errors(w: np.ndarray, bitwidths) -> dict:
-    """Per-column-scale RTN MSE at each bitwidth. w is float32 numpy."""
+def rtn_errors(w: np.ndarray, bitwidths, col_weights=None, clip_search: bool = False) -> dict:
+    """Per-column-scale RTN MSE at each bitwidth.
+
+    ``col_weights`` (per input column, mean-1) turn the plain MSE into an
+    activation-weighted one: columns that see large activations count
+    more, matching the diagonal-Hessian objective an imatrix encodes.
+    ``clip_search`` also sweeps per-column scale multipliers below the
+    max-abs scale and keeps the MSE-optimal one per bitwidth (recorded
+    under ``"clip"``); this is a scale search in the builder's symmetric
+    RTN model, and the recorded clip is applied at quantize time.
+    """
     out = {}
     flat = w.astype(np.float32, copy=False)
+    if flat.ndim != 2:
+        flat = flat.reshape(-1, flat.shape[-1])
+    if col_weights is not None:
+        cw = np.asarray(col_weights, dtype=np.float64).reshape(-1)
+        if cw.shape[0] != flat.shape[1]:
+            cw = None  # shape mismatch (e.g. fused qkv): fall back unweighted
+        elif cw.sum() <= 0:
+            # Never activated: quantization error here has no output effect.
+            return {str(bw): {"error": 0.0, "clip": 1.0} for bw in bitwidths}
+    else:
+        cw = None
+    clips = (1.0, 0.9, 0.8, 0.7, 0.6) if clip_search else (1.0,)
+    max_abs = np.abs(flat).max(axis=0)
     for bw in bitwidths:
         qmax = float((1 << (bw - 1)) - 1)
-        scale = np.abs(flat).max(axis=0) / qmax
-        scale = np.where(scale == 0, 1.0, scale)
-        w_q = np.round(flat / scale) * scale
-        err = float(np.mean((flat - w_q) ** 2))
-        out[str(bw)] = {"error": err}
+        best_err, best_clip = None, 1.0
+        for clip in clips:
+            scale = max_abs * clip / qmax
+            scale = np.where(scale == 0, 1.0, scale)
+            w_q = np.round(flat / scale) * scale
+            sq = (flat - w_q) ** 2
+            if cw is not None:
+                err = float((sq.mean(axis=0) * cw).sum() / cw.sum())
+            else:
+                err = float(sq.mean())
+            if best_err is None or err < best_err:
+                best_err, best_clip = err, clip
+        out[str(bw)] = {"error": best_err, "clip": best_clip}
     return out
 
 
@@ -87,6 +117,13 @@ def main():
     ap.add_argument("--group-size", type=int, default=64)  # accepted; RTN here is per-column
     ap.add_argument("--quant-mode", default="affine")
     ap.add_argument("--limit-shards", type=int, default=None, help="smoke-test helper")
+    ap.add_argument("--imatrix", default=None,
+                    help="Path to a GGUF imatrix file or local .npz capture; "
+                         "weights RTN errors per input column by activation "
+                         "importance and aggregates expert rows by routing counts")
+    ap.add_argument("--clip-search", action="store_true",
+                    help="Sweep per-column scale multipliers and keep the "
+                         "MSE-optimal clip per tensor/bitwidth")
     # Legacy passthrough args (ignored; kept for caller compatibility).
     ap.add_argument("--model-type", default=None)
     ap.add_argument("--calibration", default=None)
@@ -115,6 +152,16 @@ def main():
         shards = shards[: args.limit_shards]
     print(f"Shards: {len(shards)} (of full set), bitwidths: {bitwidths}", flush=True)
 
+    imatrix = None
+    if args.imatrix:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+        from rco_mlx.imatrix import Imatrix
+
+        imatrix = Imatrix(Path(args.imatrix))
+        print(f"Imatrix: {args.imatrix} ({len(imatrix.tensor_names())} tensors)", flush=True)
+    if args.clip_search:
+        print("Clip search: enabled (scales 1.0/0.9/0.8/0.7/0.6 per tensor)", flush=True)
+
     # Resume state.
     done_keys = set()
     agg = {}   # row_key -> {err_sum: {bw: weighted}, params, members}
@@ -127,6 +174,10 @@ def main():
         rows = ckpt.get("rows", {})
         param_counts = ckpt.get("param_counts", {})
         print(f"Resuming: {len(done_keys)} tensors already done", flush=True)
+        # Migrate pre-imatrix checkpoints (no weight_sum/clip_sum fields).
+        for a in agg.values():
+            a.setdefault("weight_sum", float(a.get("params", 0)))
+            a.setdefault("clip_sum", {str(b): 0.0 for b in bitwidths})
     elif out_path.exists():
         print(f"Output already exists ({out_path}); re-running will rebuild it.", flush=True)
 
@@ -142,14 +193,25 @@ def main():
                 total_keys += 1
                 w = f.get_tensor(key).float().numpy()
                 n = int(w.size)
-                errs = rtn_errors(w, bitwidths)
+                col_w, route_w = None, 1.0
+                if imatrix is not None:
+                    mapped = imatrix.col_weights_for_hf_key(key)
+                    if mapped is not None:
+                        col_w, route_w = mapped
+                errs = rtn_errors(w, bitwidths, col_weights=col_w,
+                                  clip_search=args.clip_search)
                 del w
                 row = expert_row_key(key)
                 if row is not None:
                     a = agg.setdefault(row, {"err_sum": {str(b): 0.0 for b in bitwidths},
-                                             "params": 0, "members": 0})
+                                             "params": 0, "members": 0,
+                                             "weight_sum": 0.0,
+                                             "clip_sum": {str(b): 0.0 for b in bitwidths}})
+                    agg_w = route_w if imatrix is not None else float(n)
                     for b in bitwidths:
-                        a["err_sum"][str(b)] += errs[str(b)]["error"] * n
+                        a["err_sum"][str(b)] += errs[str(b)]["error"] * agg_w
+                        a["clip_sum"][str(b)] += errs[str(b)]["clip"] * agg_w
+                    a["weight_sum"] += agg_w
                     a["params"] += n
                     a["members"] += 1
                 else:
@@ -161,15 +223,25 @@ def main():
               f"total done {len(done_keys)}", flush=True)
         save_checkpoint(ckpt_path, done_keys, agg, rows, param_counts)
 
-    # Finalize expert aggregates -> weighted-mean rows.
+    # Finalize expert aggregates -> weighted-mean rows (routing-weighted
+    # when an imatrix was used, param-weighted otherwise).
+    clips: dict = {}
     for row, a in agg.items():
-        p = a["params"] or 1
-        rows[row] = {str(b): {"error": a["err_sum"][str(b)] / p} for b in bitwidths}
+        denom = a.get("weight_sum") or a["params"] or 1
+        rows[row] = {str(b): {"error": a["err_sum"][str(b)] / denom,
+                              "clip": a["clip_sum"][str(b)] / denom}
+                     for b in bitwidths}
         param_counts[row] = a["params"]
+        clips[row] = {str(b): rows[row][str(b)]["clip"] for b in bitwidths}
+    for key, errs in rows.items():
+        if key in clips:
+            continue
+        clips[key] = {str(b): errs[str(b)].get("clip", 1.0) for b in bitwidths}
 
     ordered = {k: rows[k] for k in sorted(rows)}
     ordered_pc = {k: param_counts.get(k, 0) for k in ordered}
-    error_db = {"layers": ordered, "param_counts": ordered_pc}
+    error_db = {"layers": ordered, "param_counts": ordered_pc,
+                "clips": {k: clips[k] for k in sorted(clips)}}
     tmp = out_path.with_suffix(".tmp")
     tmp.write_text(json.dumps(error_db, indent=2))
     tmp.replace(out_path)
