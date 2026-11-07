@@ -83,7 +83,11 @@ def rtn_errors(w: np.ndarray, bitwidths, col_weights=None, clip_search: bool = F
         for clip in clips:
             scale = max_abs * clip / qmax
             scale = np.where(scale == 0, 1.0, scale)
-            w_q = np.round(flat / scale) * scale
+            # Saturate to the grid: real quantizers cannot represent values
+            # beyond +-qmax, so a clip that only looks good without
+            # saturation (huge outlier error at quantize time) must not
+            # win the search here either.
+            w_q = np.clip(np.round(flat / scale), -qmax, qmax) * scale
             sq = (flat - w_q) ** 2
             if cw is not None:
                 err = float((sq.mean(axis=0) * cw).sum() / cw.sum())
