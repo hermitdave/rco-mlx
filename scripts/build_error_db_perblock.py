@@ -34,7 +34,7 @@ SKIP_SUBSTRINGS = (
 SKIP_PREFIXES = ("mtp.",)  # MTP head -- BF16 preserved
 
 EXPERT_RE = re.compile(
-    r"^(model\.language_model\.layers\.\d+\.mlp\.experts)\.\d+\.([a-z_]+)\.weight$"
+    r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.mlp\.experts)\.\d+\.([a-z_]+)\.weight$"
 )
 
 
