@@ -45,6 +45,13 @@ from rco_mlx import (
     write_config,
 )
 from rco_mlx.search import budget_dp, values_from_losses
+from rco_mlx.expert_alloc import (
+    apply_gguf_recipe,
+    enforce_group_uniformity,
+    expert_group_key,
+    fill_missing_expert_groups,
+    uniform_expert_bits,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +739,14 @@ def main():
     ap.add_argument("--no-gptq", action="store_true", help="Disable GPTQ scaling, use plain RTN")
     ap.add_argument("--ad-ladder", action="store_true",
                     help="Use AtomicChat AD ladder (rule-based) instead of RCO measurement")
+    ap.add_argument("--expert-allocation", default="uniform",
+                    choices=["uniform", "per-projection", "gguf-recipe"],
+                    help="Expert bitwidth allocation: 'uniform' forces one bitwidth "
+                         "for all routed experts (legacy, sanitize-safe); "
+                         "'per-projection' keeps the DP assignment but enforces "
+                         "uniformity only within each (layer, projection) stacked "
+                         "tensor; 'gguf-recipe' overrides experts with the measured "
+                         "UD-IQ2_XS per-layer recipe (qwen4_exp, 48 layers only)")
     ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
     ap.add_argument("--batch-size", type=int, default=4, help="Calibration batch size")
 
@@ -962,29 +977,72 @@ def main():
         print(f"  achieved {report['achieved_bpw']:.4f} bpw")
         print(f"  histogram: {report['bit_histogram']}")
 
-        # Force experts to uniform bitwidth for sanitize compatibility
-        # (mixed bits per expert break OlmoeSparseMoeBlock stacking)
-        # Adapt bitwidth to target bpw: lower targets -> lower expert bits
-        if args.target_bpw <= 2.5:
-            expert_bits = 2
-        elif args.target_bpw <= 3.5:
-            expert_bits = 3
-        elif args.target_bpw <= 4.5:
-            expert_bits = 4
-        elif args.target_bpw <= 5.5:
-            expert_bits = 5
-        else:
-            expert_bits = 6
-        print(f"  expert bitwidth: {expert_bits} (target {args.target_bpw} bpw)")
-        # Add all expert groups to assignment with uniform bitwidth
-        for g in groups:
-            name = g.layer_names[0]
-            low = name.lower()
-            if ("experts" in low or "switch_mlp" in low or "switch_glu" in low) and name not in assignment:
-                assignment[name] = expert_bits
-        for k in list(assignment.keys()):
-            if "experts" in k.lower() or "switch_mlp" in k.lower() or "switch_glu" in k.lower():
-                assignment[k] = expert_bits
+        # Expert allocation. The sanitize constraint is uniformity *within*
+        # each stacked (layer, projection) tensor, not across the model.
+        # 'uniform' (legacy) forces one bitwidth for every routed expert;
+        # 'per-projection' keeps the DP's per-group assignment and only
+        # enforces that within-group invariant; 'gguf-recipe' overrides the
+        # experts with the measured UD-IQ2_XS recipe (qwen4_exp only).
+        all_names = [g.layer_names[0] for g in groups]
+        if args.expert_allocation == "uniform":
+            expert_bits = uniform_expert_bits(args.target_bpw)
+            print(f"  expert bitwidth: {expert_bits} (target {args.target_bpw} bpw)")
+            # Add all expert groups to assignment with uniform bitwidth.
+            # Substring test kept from the legacy path so any expert naming
+            # the regexes don't parse still gets forced in uniform mode.
+            def _is_expert(name: str) -> bool:
+                low = name.lower()
+                return (
+                    expert_group_key(name) is not None
+                    or "experts" in low
+                    or "switch_mlp" in low
+                    or "switch_glu" in low
+                )
+
+            for g in groups:
+                name = g.layer_names[0]
+                if _is_expert(name) and name not in assignment:
+                    assignment[name] = expert_bits
+            for k in list(assignment.keys()):
+                if _is_expert(k):
+                    assignment[k] = expert_bits
+        elif args.expert_allocation == "per-projection":
+            fallback = uniform_expert_bits(args.target_bpw)
+            assignment, n_filled = fill_missing_expert_groups(
+                assignment, all_names, fallback_bits=fallback
+            )
+            assignment, n_overridden = enforce_group_uniformity(assignment, all_names)
+            proj_hist: dict[tuple[int, str], int] = {}
+            for k, v in assignment.items():
+                gk = expert_group_key(k)
+                if gk is not None:
+                    proj_hist.setdefault(gk, v)
+            print(f"  per-projection experts: {len(proj_hist)} (layer, projection) "
+                  f"groups, filled {n_filled}, uniformity overrides {n_overridden}")
+            print(f"  expert group bit histogram: "
+                  f"{dict(Counter(proj_hist.values()))}")
+        else:  # gguf-recipe
+            try:
+                assignment, n_overridden = apply_gguf_recipe(
+                    assignment, all_names, model_type=args.model_type
+                )
+            except ValueError as exc:
+                sys.exit(str(exc))
+            assignment, n_filled = fill_missing_expert_groups(
+                assignment, all_names,
+                fallback_bits=uniform_expert_bits(args.target_bpw),
+            )
+            assignment, n_conflicts = enforce_group_uniformity(assignment, all_names)
+            proj_hist = {}
+            for k, v in assignment.items():
+                gk = expert_group_key(k)
+                if gk is not None:
+                    proj_hist.setdefault(gk, v)
+            print(f"  gguf-recipe experts: {len(proj_hist)} groups, "
+                  f"overridden {n_overridden}, filled {n_filled}, "
+                  f"conflicts {n_conflicts}")
+            print(f"  expert group bit histogram: "
+                  f"{dict(Counter(proj_hist.values()))}")
 
     # --- Step 4: emit + validate ---
     print("[4/5] emitting MLX config + validating …")

@@ -342,6 +342,35 @@ construction without loading the full BF16 model into memory) is inspired by
 [oMLX](https://github.com/jundot/omlx) (`omlx/oq.py`), specifically the
 `_iter_streamed_layer_blocks` and `_streamed_sensitivity_layer` patterns.
 
+## Expert allocation modes
+
+The sanitize constraint only requires all experts *inside* one stacked
+`(layer, projection)` tensor to share a bitwidth — not across projections
+or layers. `--expert-allocation` selects how routed experts get their bits:
+
+- `uniform` (default, legacy): one bitwidth for every routed expert.
+- `per-projection`: keep the DP assignment; enforce uniformity only
+  within each `(layer, projection)` group (majority vote, missing groups
+  inherit their layer's majority). Lets the DP put e.g. gate/up at 2-bit
+  and down at 4-bit in the same layer.
+- `gguf-recipe`: override experts with the per-layer recipe measured from
+  Unsloth UD-IQ2_XS headers for Qwen3.8-Flash-Next (`qwen4_exp`, 48
+  layers): gate/up 2-bit throughout, down at 4-bit on 24 layers, 2-bit on
+  23, 6-bit on layer 4. At group size 64 this predicts 43.2 GB for the
+  expert weights vs 42.3 GB measured in the GGUF.
+
+```bash
+python examples/moe_pipeline.py \
+    --source /path/to/bf16-qwen4exp \
+    --output /path/to/output \
+    --target-bpw 3.0 --group-size 64 --model-type qwen4_exp \
+    --error-db error_db.json \
+    --expert-allocation per-projection   # or gguf-recipe
+```
+
+See `src/rco_mlx/expert_alloc.py` for the grouping logic and the
+measured recipe tables.
+
 ---
 
 ## License
