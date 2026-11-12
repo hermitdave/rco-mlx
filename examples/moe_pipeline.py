@@ -550,6 +550,10 @@ def per_group_clip_search(
     per-slice quantization).
     """
     out, inn = w_np.shape
+    if inn % gs != 0:
+        raise ValueError(
+            f"per_group_clip_search: last dim {inn} not divisible by group size {gs}"
+        )
     g = inn // gs
     wg = w_np.reshape(out, g, gs)
     max_abs = np.abs(wg).max(axis=2)  # [out, g]
