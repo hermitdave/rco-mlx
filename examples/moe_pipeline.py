@@ -1145,10 +1145,10 @@ def main():
                          "(default: 1.0 down to 0.6 in 0.05 steps)")
     ap.add_argument("--clip-max-bits", type=int, default=8,
                     help="Only run the --per-group-clip search at or below this "
-                         "bitwidth (default 8 = all quantized tensors). At high "
-                         "bitwidths the weighted search trades a large plain-MSE "
-                         "increase for a small weighted-MSE gain, so gating it to "
-                         "low-bit tensors is worth testing")
+                         "bitwidth (default 8 = all quantized tensors). Measured on "
+                         "OLMoE @2.5: gating to <=3 bits is WORSE (KL 0.466 vs "
+                         "0.452) because the weighted search also helps at 4/8-bit, "
+                         "so the default stays 8")
     ap.add_argument("--per-tensor-group-size", action="store_true",
                     help="Assign per-tensor group sizes from measured "
                          "sensitivity (top-quartile -> gs32, bottom-half -> "
