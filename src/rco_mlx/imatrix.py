@@ -108,6 +108,7 @@ class Imatrix:
         self._gguf = None
         self._npz = None
         self._names: Optional[set] = None
+        self._cache: Dict[str, np.ndarray] = {}
         if self.path.suffix == ".npz":
             self._npz = np.load(str(self.path))
             self._names = set(self._npz.files)
@@ -131,9 +132,14 @@ class Imatrix:
     def _get(self, name: str) -> np.ndarray:
         if self._npz is not None:
             return np.asarray(self._npz[name])
+        cached = self._cache.get(name)
+        if cached is not None:
+            return cached
         for tensor in self._gguf.tensors:
             if tensor.name == name:
-                return np.asarray(tensor.data, dtype=np.float64)
+                data = np.asarray(tensor.data, dtype=np.float64)
+                self._cache[name] = data
+                return data
         raise KeyError(name)
 
     def in_sum2(self, gguf_tensor: str) -> np.ndarray:

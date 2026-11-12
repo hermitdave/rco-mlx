@@ -613,6 +613,7 @@ def stream_quantize(
     imatrix_path: Path | None = None,
     per_group_clip: bool = False,
     clip_grid=PER_GROUP_CLIP_GRID,
+    clip_max_bits: int = 8,
 ):
     """Stream through BF16 source, quantize per allocation, write shards."""
     import torch
@@ -790,7 +791,7 @@ def stream_quantize(
                         continue
                     if tensor.ndim == 2:
                         w_np = tensor.float().numpy()
-                        if per_group_clip:
+                        if per_group_clip and bits <= clip_max_bits:
                             # Per-group scale choice. Weighted by the imatrix
                             # when available; otherwise plain MSE.
                             col_w = None
@@ -1125,6 +1126,12 @@ def main():
     ap.add_argument("--clip-grid", default=None,
                     help="Comma-separated clip ratios for --per-group-clip "
                          "(default: 1.0 down to 0.6 in 0.05 steps)")
+    ap.add_argument("--clip-max-bits", type=int, default=8,
+                    help="Only run the --per-group-clip search at or below this "
+                         "bitwidth (default 8 = all quantized tensors). At high "
+                         "bitwidths the weighted search trades a large plain-MSE "
+                         "increase for a small weighted-MSE gain, so gating it to "
+                         "low-bit tensors is worth testing")
     ap.add_argument("--per-tensor-group-size", action="store_true",
                     help="Assign per-tensor group sizes from measured "
                          "sensitivity (top-quartile -> gs32, bottom-half -> "
@@ -1499,7 +1506,7 @@ def main():
         model_adapter=model_adapter, quant_mode=args.quant_mode,
         group_size_map=group_size_map or None, clip_map=clip_map or None,
         imatrix_path=imatrix_path, per_group_clip=args.per_group_clip,
-        clip_grid=clip_grid,
+        clip_grid=clip_grid, clip_max_bits=args.clip_max_bits,
     )
 
     # Post-process: apply Qwen3.5 sanitize for quantized weights
