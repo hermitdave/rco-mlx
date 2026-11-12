@@ -629,6 +629,13 @@ def stream_quantize(
             f"[quant] per-group clip search: grid {tuple(clip_grid)}, "
             f"imatrix {len(imatrix.tensor_names())} tensors"
         )
+    elif per_group_clip:
+        print(
+            "[quant] WARNING: --per-group-clip without an imatrix; skipping the "
+            "search. An unweighted search is measured to be WORSE than the "
+            "per-tensor clip (OLMoE @2.5 KL 0.559 vs 0.508). Pass "
+            "--imatrix/--imatrix-repo/--build-imatrix."
+        )
 
     cfg = allocation_to_config(
         assignment, group_size=group_size, mode=quant_mode,
@@ -792,19 +799,28 @@ def stream_quantize(
                     if tensor.ndim == 2:
                         w_np = tensor.float().numpy()
                         if per_group_clip and bits <= clip_max_bits:
-                            # Per-group scale choice. Weighted by the imatrix
-                            # when available; otherwise plain MSE.
-                            col_w = None
-                            if imatrix is not None:
-                                col_w = _imatrix_col_weights(imatrix, key, w_np.shape[-1])
-                            clips = per_group_clip_search(
-                                w_np, col_w, bits, q_gs, quant_mode, clip_grid
+                            # Per-group scale choice, weighted by the imatrix.
+                            # Only run when the tensor actually has imatrix
+                            # column weights: an unweighted search is
+                            # measured to be WORSE than the per-tensor clip
+                            # (OLMoE @2.5 KL 0.559 vs 0.508), so never
+                            # silently fall back to one.
+                            col_w = (
+                                _imatrix_col_weights(imatrix, key, w_np.shape[-1])
+                                if imatrix is not None
+                                else None
                             )
-                            w_np = _apply_clips(w_np, clips, q_gs)
-                            n_pg_search += 1
-                            vals, cnts = np.unique(clips, return_counts=True)
-                            for v, c in zip(vals, cnts):
-                                clip_hist[float(v)] = clip_hist.get(float(v), 0) + int(c)
+                            if col_w is not None:
+                                clips = per_group_clip_search(
+                                    w_np, col_w, bits, q_gs, quant_mode, clip_grid
+                                )
+                                w_np = _apply_clips(w_np, clips, q_gs)
+                                n_pg_search += 1
+                                vals, cnts = np.unique(clips, return_counts=True)
+                                for v, c in zip(vals, cnts):
+                                    clip_hist[float(v)] = clip_hist.get(float(v), 0) + int(c)
+                            else:
+                                w_np = _apply_clip(w_np, q_gs, q_clip)
                         else:
                             w_np = _apply_clip(w_np, q_gs, q_clip)
                         w = mx.array(w_np)
@@ -1120,9 +1136,10 @@ def main():
     ap.add_argument("--per-group-clip", action="store_true",
                     help="At quantize time, choose a clip ratio per (row, group) "
                          "minimising imatrix-weighted reconstruction MSE, evaluated "
-                         "with the real quantizer. Weighting needs an imatrix "
-                         "(--imatrix/--imatrix-repo/--build-imatrix); without one it "
-                         "falls back to unweighted MSE")
+                         "with the real quantizer. Requires an imatrix "
+                         "(--imatrix/--imatrix-repo/--build-imatrix); without one "
+                         "the search is skipped, because an unweighted search is "
+                         "measured to be worse than the per-tensor clip")
     ap.add_argument("--clip-grid", default=None,
                     help="Comma-separated clip ratios for --per-group-clip "
                          "(default: 1.0 down to 0.6 in 0.05 steps)")
