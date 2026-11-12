@@ -90,3 +90,107 @@ def test_fits_in_memory_gate(tmp_path):
     assert model_bytes == 1024
     assert ram > 0
     assert fits is True
+
+
+def test_per_group_clip_search_reduces_weighted_mse():
+    """Per-group search must beat no-clip on the weighted objective."""
+    import importlib.util
+
+    from rco_mlx.imatrix import Imatrix  # noqa: F401  (ensure import path)
+
+    pipe = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
+    spec = importlib.util.spec_from_file_location("moe_pipeline", pipe)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    rng = np.random.default_rng(0)
+    w = rng.normal(size=(64, 256)).astype(np.float32)
+    w[:, 0] *= 20.0  # one high-importance outlier column
+    col_w = np.ones(256, dtype=np.float64)
+    col_w[0] = 10.0
+
+    clips = mod.per_group_clip_search(
+        w, col_w, bits=2, gs=64, mode="affine",
+        clip_grid=mod.PER_GROUP_CLIP_GRID,
+    )
+    assert clips.shape == (64, 4)
+    assert np.all((clips >= min(mod.PER_GROUP_CLIP_GRID)) & (clips <= 1.0))
+    # every returned value is a grid member
+    assert set(np.unique(clips)).issubset(set(mod.PER_GROUP_CLIP_GRID))
+
+    # weighted MSE of the chosen clips <= no-clip
+    wg = w.reshape(64, 4, 64)
+    cw = col_w.reshape(4, 64)
+    clipped = mod._apply_clips(w, clips, 64).reshape(64, 4, 64)
+    dq = mod._quantize_dequant_np(clipped, 2, 64, "affine").reshape(64, 4, 64)
+    err_search = float((cw[None] * (wg - dq) ** 2).sum())
+    dq0 = mod._quantize_dequant_np(w, 2, 64, "affine").reshape(64, 4, 64)
+    err_base = float((cw[None] * (wg - dq0) ** 2).sum())
+    assert err_search <= err_base + 1e-9
+
+
+def test_per_group_clip_search_unweighted_matches_plain_mse():
+    import importlib.util
+
+    pipe = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
+    spec = importlib.util.spec_from_file_location("moe_pipeline", pipe)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    rng = np.random.default_rng(1)
+    w = rng.normal(size=(32, 128)).astype(np.float32)
+    clips = mod.per_group_clip_search(
+        w, None, bits=3, gs=64, mode="affine",
+        clip_grid=(1.0, 0.9, 0.8),
+    )
+    wg = w.reshape(32, 2, 64)
+    clipped = mod._apply_clips(w, clips, 64).reshape(32, 2, 64)
+    dq = mod._quantize_dequant_np(clipped, 3, 64, "affine").reshape(32, 2, 64)
+    err = float(((wg - dq) ** 2).sum())
+    dq0 = mod._quantize_dequant_np(w, 3, 64, "affine").reshape(32, 2, 64)
+    assert err <= float(((wg - dq0) ** 2).sum()) + 1e-9
+
+
+def test_imatrix_col_weights_helper(tmp_path):
+    import importlib.util
+
+    pipe = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
+    spec = importlib.util.spec_from_file_location("moe_pipeline", pipe)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    path = tmp_path / "imatrix.npz"
+    np.savez(
+        str(path),
+        **{
+            "model.layers.0.mlp.experts.0.gate_proj.weight.in_sum2":
+                np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+            "model.layers.0.mlp.experts.0.gate_proj.weight.counts":
+                np.array([10.0], dtype=np.float32),
+        },
+    )
+    im = Imatrix(path)
+    col = mod._imatrix_col_weights(
+        im, "model.layers.0.mlp.experts.0.gate_proj.weight", 4)
+    assert col is not None and col.shape == (4,)
+    # wrong width -> None
+    assert mod._imatrix_col_weights(
+        im, "model.layers.0.mlp.experts.0.gate_proj.weight", 8) is None
+    # unmapped key -> None
+    assert mod._imatrix_col_weights(im, "model.layers.0.self_attn.q_proj.weight", 4) is None
+
+
+def test_apply_clips_respects_per_group_ratio():
+    import importlib.util
+
+    pipe = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
+    spec = importlib.util.spec_from_file_location("moe_pipeline", pipe)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    w = np.array([[1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]], dtype=np.float32)
+    clips = np.array([[0.5, 1.0]])
+    out = mod._apply_clips(w, clips, 4)
+    # group 0 clamped to +-0.5*4 = +-2 ; group 1 untouched
+    assert np.allclose(out[0, :4], [1.0, -2.0, 2.0, -2.0])
+    assert np.allclose(out[0, 4:], w[0, 4:])

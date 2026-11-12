@@ -487,6 +487,120 @@ def _filter_bf16_prefixes(assignment: dict[str, int], prefixes: list[str]) -> di
 # Step 5: streaming quantize (MoE-only, batched experts)
 # ---------------------------------------------------------------------------
 
+# Candidate per-group clip ratios for the quantize-time scale search. The
+# search evaluates each candidate with the real quantizer and keeps the
+# per-group MSE-optimal one, so the grid only needs to bracket the useful
+# range: measured optima on OLMoE sit between 0.6 and 1.0, and aggressive
+# clips (<=0.6) are where weight-MSE proxies have previously diverged from
+# real model quality.
+PER_GROUP_CLIP_GRID = (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6)
+
+
+def _quantize_dequant_np(
+    w_np: np.ndarray, bits: int, gs: int, mode: str
+) -> np.ndarray:
+    """Quantize then dequantize with MLX, returning float32 numpy."""
+    import mlx.core as mx
+
+    q, scales, biases = mx.quantize(
+        mx.array(w_np), bits=bits, group_size=gs, mode=mode
+    )
+    mx.eval(q, scales, biases)
+    dq = mx.dequantize(q, scales, biases, group_size=gs, bits=bits, mode=mode)
+    mx.eval(dq)
+    return np.array(dq)
+
+
+def _apply_clips(w_np: np.ndarray, clips: np.ndarray, gs: int) -> np.ndarray:
+    """Clamp each ``gs``-wide group at ``clips * group_max_abs``.
+
+    ``clips`` is ``[rows, n_groups]``; a value of 1.0 leaves the group
+    untouched. This is the per-group generalisation of the per-tensor clip:
+    ``mx.quantize`` derives its scale from the clamped range, so a per-group
+    clamp is exactly a per-group scale choice.
+    """
+    out, inn = w_np.shape
+    g = inn // gs
+    wg = w_np.reshape(out, g, gs)
+    max_abs = np.abs(wg).max(axis=2, keepdims=True)
+    return np.clip(
+        wg, -clips[:, :, None] * max_abs, clips[:, :, None] * max_abs
+    ).reshape(out, inn)
+
+
+def per_group_clip_search(
+    w_np: np.ndarray,
+    col_w: np.ndarray | None,
+    bits: int,
+    gs: int,
+    mode: str,
+    clip_grid=PER_GROUP_CLIP_GRID,
+    max_batch_bytes: int = 256 * 1024 * 1024,
+) -> np.ndarray:
+    """Choose one clip ratio per (row, group) minimising weighted MSE.
+
+    ``col_w`` is the imatrix per-input-column importance (mean-1). The
+    objective is ``sum_j col_w[j] * (w[:,j] - dequant(quant(w[:,j])))^2``,
+    i.e. the diagonal-Hessian output error an imatrix encodes. Passing
+    ``col_w=None`` falls back to plain MSE.
+
+    Returns ``[rows, n_groups]`` clip ratios. Candidates are evaluated in
+    memory-bounded batches by stacking them into the leading axis, which
+    ``mx.quantize`` treats as independent slices (verified bit-exact against
+    per-slice quantization).
+    """
+    out, inn = w_np.shape
+    g = inn // gs
+    wg = w_np.reshape(out, g, gs)
+    max_abs = np.abs(wg).max(axis=2)  # [out, g]
+    if col_w is not None:
+        cw = np.asarray(col_w, dtype=np.float64).reshape(g, gs)
+    else:
+        cw = np.ones((g, gs), dtype=np.float64)
+
+    best_err = np.full((out, g), np.inf)
+    best_clip = np.ones((out, g))
+    clips = np.asarray(clip_grid, dtype=np.float64)
+
+    per_clip_bytes = max(out * inn * 4, 1)
+    batch = max(1, min(len(clips), max_batch_bytes // per_clip_bytes))
+    for i in range(0, len(clips), batch):
+        chunk = clips[i : i + batch]
+        stacked = np.stack(
+            [np.clip(wg, -c * max_abs[:, :, None], c * max_abs[:, :, None]) for c in chunk]
+        ).reshape(len(chunk), out, inn)
+        dq = _quantize_dequant_np(stacked, bits, gs, mode).reshape(
+            len(chunk), out, g, gs
+        )
+        err = (cw[None, None] * (wg[None] - dq) ** 2).sum(axis=-1)  # [C, out, g]
+        chunk_min = err.min(axis=0)
+        chunk_arg = err.argmin(axis=0)
+        mask = chunk_min < best_err
+        best_err = np.where(mask, chunk_min, best_err)
+        best_clip = np.where(mask, chunk[chunk_arg], best_clip)
+    return best_clip
+
+
+def _imatrix_col_weights(imatrix, hf_key: str, n_cols: int) -> np.ndarray | None:
+    """Per-input-column importance for ``hf_key``, or ``None`` if unmapped.
+
+    Returns a mean-1 vector of length ``n_cols`` (the imatrix layout), or
+    ``None`` when the tensor is absent from the imatrix, the mapping is
+    unknown, or the width does not match (e.g. a fused QKV tensor).
+    """
+    try:
+        mapped = imatrix.col_weights_for_hf_key(hf_key)
+    except Exception:
+        return None
+    if mapped is None:
+        return None
+    col_w, _ = mapped
+    col_w = np.asarray(col_w, dtype=np.float64).reshape(-1)
+    if col_w.shape[0] != n_cols:
+        return None
+    return col_w
+
+
 def stream_quantize(
     source_dir: Path,
     output_dir: Path,
@@ -496,11 +610,24 @@ def stream_quantize(
     quant_mode: str = "affine",
     group_size_map: dict[str, int] | None = None,
     clip_map: dict[str, float] | None = None,
+    imatrix_path: Path | None = None,
+    per_group_clip: bool = False,
+    clip_grid=PER_GROUP_CLIP_GRID,
 ):
     """Stream through BF16 source, quantize per allocation, write shards."""
     import torch
 
     from rco_mlx.mlx_alloc import MlxQuantConfig
+
+    imatrix = None
+    if per_group_clip and imatrix_path is not None:
+        from rco_mlx.imatrix import Imatrix
+
+        imatrix = Imatrix(imatrix_path)
+        print(
+            f"[quant] per-group clip search: grid {tuple(clip_grid)}, "
+            f"imatrix {len(imatrix.tensor_names())} tensors"
+        )
 
     cfg = allocation_to_config(
         assignment, group_size=group_size, mode=quant_mode,
@@ -631,6 +758,9 @@ def stream_quantize(
     shards = sorted(source_dir.glob("*.safetensors"))
     output_dir.mkdir(parents=True, exist_ok=True)
     total_tensors = 0
+    n_pg_search = 0
+    n_3d_skipped = 0
+    clip_hist: dict[float, int] = {}
     start = time.time()
 
     for i, shard_path in enumerate(shards):
@@ -659,7 +789,23 @@ def stream_quantize(
                         results[key] = tensor.to(torch.bfloat16)
                         continue
                     if tensor.ndim == 2:
-                        w_np = _apply_clip(tensor.float().numpy(), q_gs, q_clip)
+                        w_np = tensor.float().numpy()
+                        if per_group_clip:
+                            # Per-group scale choice. Weighted by the imatrix
+                            # when available; otherwise plain MSE.
+                            col_w = None
+                            if imatrix is not None:
+                                col_w = _imatrix_col_weights(imatrix, key, w_np.shape[-1])
+                            clips = per_group_clip_search(
+                                w_np, col_w, bits, q_gs, quant_mode, clip_grid
+                            )
+                            w_np = _apply_clips(w_np, clips, q_gs)
+                            n_pg_search += 1
+                            vals, cnts = np.unique(clips, return_counts=True)
+                            for v, c in zip(vals, cnts):
+                                clip_hist[float(v)] = clip_hist.get(float(v), 0) + int(c)
+                        else:
+                            w_np = _apply_clip(w_np, q_gs, q_clip)
                         w = mx.array(w_np)
                         q, scales, biases = mx.quantize(
                             w, bits=bits, group_size=q_gs, mode=quant_mode
@@ -687,6 +833,12 @@ def stream_quantize(
                         # Stacked MoE expert tensor: quantize ALL experts in batch
                         E, H, I = tensor.shape
                         flat = tensor.reshape(E * H, I)
+                        if per_group_clip and imatrix is not None:
+                            # Per-group search is implemented for 2D tensors
+                            # (per-expert HF keys). Stacked 3D tensors would
+                            # need per-expert column weights; fall back to the
+                            # per-tensor clip rather than silently skipping.
+                            n_3d_skipped += 1
                         w_flat_np = _apply_clip(flat.float().numpy(), q_gs, q_clip)
                         w_flat = mx.array(w_flat_np)
                         q_flat, scales_flat, biases_flat = mx.quantize(
@@ -756,6 +908,16 @@ def stream_quantize(
             shutil.copy2(f, dest)
 
     print(f"\n[quant] done — {total_tensors} tensors, {time.time()-start:.1f}s total")
+    if per_group_clip and imatrix is not None:
+        print(
+            f"[quant] per-group clip search applied to {n_pg_search} tensors"
+            + (f", skipped {n_3d_skipped} stacked 3D tensors" if n_3d_skipped else "")
+        )
+    if clip_hist:
+        total = sum(clip_hist.values())
+        print(f"[quant] per-group clip histogram ({total} groups):")
+        for v in sorted(clip_hist, reverse=True):
+            print(f"  {v:.2f}: {clip_hist[v]} ({100*clip_hist[v]/total:.1f}%)")
 
 
 def _rewrite_config_mlx_keys(output_dir: Path, model_adapter, quant_mode: str = "affine"):
@@ -954,6 +1116,15 @@ def main():
     ap.add_argument("--clip-search", action="store_true",
                     help="Sweep per-tensor scale multipliers in the error DB "
                          "and apply the recorded clip at quantize time")
+    ap.add_argument("--per-group-clip", action="store_true",
+                    help="At quantize time, choose a clip ratio per (row, group) "
+                         "minimising imatrix-weighted reconstruction MSE, evaluated "
+                         "with the real quantizer. Weighting needs an imatrix "
+                         "(--imatrix/--imatrix-repo/--build-imatrix); without one it "
+                         "falls back to unweighted MSE")
+    ap.add_argument("--clip-grid", default=None,
+                    help="Comma-separated clip ratios for --per-group-clip "
+                         "(default: 1.0 down to 0.6 in 0.05 steps)")
     ap.add_argument("--per-tensor-group-size", action="store_true",
                     help="Assign per-tensor group sizes from measured "
                          "sensitivity (top-quartile -> gs32, bottom-half -> "
@@ -1317,10 +1488,18 @@ def main():
         return
 
     print("[5/5] streaming quantization …")
+    imatrix_path = None
+    if args.per_group_clip and not args.ad_ladder:
+        imatrix_path = resolve_imatrix(args, source, output)
+    clip_grid = PER_GROUP_CLIP_GRID
+    if args.clip_grid:
+        clip_grid = tuple(float(x) for x in args.clip_grid.split(","))
     stream_quantize(
         source, output, assignment, args.group_size,
         model_adapter=model_adapter, quant_mode=args.quant_mode,
         group_size_map=group_size_map or None, clip_map=clip_map or None,
+        imatrix_path=imatrix_path, per_group_clip=args.per_group_clip,
+        clip_grid=clip_grid,
     )
 
     # Post-process: apply Qwen3.5 sanitize for quantized weights
