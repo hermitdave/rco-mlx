@@ -71,10 +71,10 @@ def hessian_errors(w, bitwidths, group_size, lam, vec) -> dict:
     return out
 
 
-def is_skipped(key: str) -> bool:
+def is_skipped(key: str, skip_substrings=SKIP_SUBSTRINGS) -> bool:
     if key.startswith(SKIP_PREFIXES):
         return True
-    return any(s in key for s in SKIP_SUBSTRINGS)
+    return any(s in key for s in skip_substrings)
 
 
 def expert_row_key(key: str):
@@ -183,6 +183,10 @@ def main():
                          "scripts/capture_hessians.py. When given, expert "
                          "tensors are scored by the Hessian-weighted output "
                          "error tr(dW H dW^T) instead of plain weight MSE")
+    ap.add_argument("--quantize-embeddings", action="store_true",
+                    help="Measure embed_tokens/lm_head too (dense models with "
+                         "--quantize-embeddings). By default they stay BF16 "
+                         "and are skipped like the n-gram/MTP tables")
     # Legacy passthrough args (ignored; kept for caller compatibility).
     ap.add_argument("--model-type", default=None)
     ap.add_argument("--calibration", default=None)
@@ -195,6 +199,12 @@ def main():
     bitwidths = [int(b) for b in args.bitwidths.split(",")]
     source = Path(args.source)
     out_path = Path(args.output)
+
+    skip_substrings = SKIP_SUBSTRINGS
+    if args.quantize_embeddings:
+        skip_substrings = tuple(
+            s for s in SKIP_SUBSTRINGS if s not in ("embed_tokens", "lm_head")
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_path.with_suffix(".checkpoint.json")
 
@@ -251,7 +261,7 @@ def main():
         n_this = 0
         with safe_open(str(sf), framework="pt", device="cpu") as f:
             for key in f.keys():
-                if not key.endswith(".weight") or is_skipped(key):
+                if not key.endswith(".weight") or is_skipped(key, skip_substrings):
                     continue
                 if key in done_keys:
                     continue

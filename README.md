@@ -242,6 +242,41 @@ the target.
 
 ---
 
+## Dense models
+
+Dense transformers are supported through the generic `default` adapter
+(restored from the pre-MoE pipeline). The allocator is architecture-agnostic:
+the error DB measures per-tensor RTN reconstruction error directly from the
+safetensors shards, so any dense model `mlx_lm` can load works as long as its
+checkpoint uses `layers.N.*` naming. One RCO group per tensor; norms,
+embeddings, `lm_head`, MTP and vision towers stay BF16.
+
+```bash
+python examples/moe_pipeline.py \
+    --source /path/to/bf16-dense \
+    --output /path/to/output \
+    --target-bpw 4.0 \
+    --group-size 64 \
+    --calibration-dataset wikitext
+```
+
+Notes:
+
+- Omit `--model-type`; the pipeline auto-selects `default` when no routed
+  experts are detected.
+- Expert-only flags (`--expert-allocation`, `--expert-min-bits`, GGUF recipe)
+  are ignored on dense models.
+- The output always gets a `model.safetensors.index.json`, so oMLX discovery
+  does not depend on shard filename numbering.
+- Calibration loading falls back to `tokenizer.json` when a custom
+  `AutoConfig` cannot be imported (needed for LFM3's hybrid rope config).
+
+### LFM3-1.7B (dense hybrid attention)
+
+Results: see `references/dense-lfm3.md`.
+
+---
+
 ## Testing
 
 ```bash

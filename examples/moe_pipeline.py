@@ -155,6 +155,8 @@ def build_error_db(
         cmd.append("--clip-search")
     if hessian_dir:
         cmd += ["--hessian-dir", str(hessian_dir)]
+    if getattr(model_adapter, "quantize_embeddings", False):
+        cmd.append("--quantize-embeddings")
 
     print(f"[2/5] building error_db: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -198,6 +200,8 @@ def run_rco_allocation(
     group_names: list[str],
     expert_min_bits: int = 2,
     group_is_expert: list[bool] | None = None,
+    group_is_embedding: list[bool] | None = None,
+    embedding_min_bits: int = 2,
 ) -> tuple[dict[str, int], dict]:
     table = LossTable(
         losses=losses,
@@ -214,6 +218,14 @@ def run_rco_allocation(
         )
         print(f"  expert floor: {expert_min_bits}-bit minimum enforced in DP "
               f"({sum(group_is_expert)} expert groups)")
+    if embedding_min_bits > int(bitwidths.min()):
+        if group_is_embedding is None:
+            sys.exit("--embedding-min-bits requires embedding group flags")
+        values = mask_values_below_min_bits(
+            values, bitwidths, group_is_embedding, embedding_min_bits
+        )
+        print(f"  embedding floor: {embedding_min_bits}-bit minimum enforced "
+              f"in DP ({sum(group_is_embedding)} embedding groups)")
     idx = budget_dp(
         values, table.fracs, table.actual_bits(), target_bpw, resolution=10000
     )
@@ -440,12 +452,16 @@ def emit_and_validate(
     quant_mode: str = "affine",
     bf16_prefixes: list[str] | None = None,
     group_size_map: dict[str, int] | None = None,
+    quantize_embeddings: bool = False,
 ) -> MlxQuantConfig:
     filtered = assignment
     if bf16_prefixes:
         filtered = _filter_bf16_prefixes(assignment, bf16_prefixes)
 
-    quant_assignment = {k: v for k, v in filtered.items() if _is_quantizable(k)}
+    quant_assignment = {
+        k: v for k, v in filtered.items()
+        if _is_quantizable(k, quantize_embeddings=quantize_embeddings)
+    }
     cfg = allocation_to_config(
         quant_assignment,
         default_bits=default_bits,
@@ -479,9 +495,11 @@ def emit_and_validate(
     return cfg
 
 
-def _is_quantizable(path: str) -> bool:
+def _is_quantizable(path: str, quantize_embeddings: bool = False) -> bool:
     check = path if path.endswith(".weight") else path + ".weight"
-    if "norm" in check or "embed" in check or "lm_head" in check or "mtp" in check:
+    if "norm" in check or "mtp" in check:
+        return False
+    if not quantize_embeddings and ("embed" in check or "lm_head" in check):
         return False
     # Only the MoE router gate is excluded (mlx_lm has no QuantizedLinear
     # for it). Routed-expert and shared-expert gate_proj projections ARE
@@ -489,6 +507,11 @@ def _is_quantizable(path: str) -> bool:
     if check.endswith(".mlp.gate.weight") or check.endswith(".switch_mlp.gate.weight"):
         return False
     return check.endswith(".weight")
+
+
+def _is_embedding_name(name: str) -> bool:
+    """True for token-embedding / lm_head module paths."""
+    return name.split(".")[-1] in ("embed_tokens", "lm_head")
 
 
 def _filter_bf16_prefixes(assignment: dict[str, int], prefixes: list[str]) -> dict[str, int]:
@@ -815,14 +838,14 @@ def stream_quantize(
 
     def should_quantize(mlx_key: str) -> tuple[bool, int, int, float]:
         gs = group_size
+        quant_embed = bool(getattr(model_adapter, "quantize_embeddings", False))
         # N-gram PLE table first: its name contains "embed", which the
         # generic exclusion below would incorrectly match.
         if model_adapter is not None and hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
             return True, model_adapter.ngram_quant_bits, model_adapter.ngram_group_size, 1.0
         if (
             "norm" in mlx_key
-            or "embed" in mlx_key
-            or "lm_head" in mlx_key
+            or (not quant_embed and ("embed" in mlx_key or "lm_head" in mlx_key))
             or "mtp" in mlx_key
             or (not mlx_key.endswith(".weight") and ".experts." not in mlx_key)
             or mlx_key.endswith(".bias")
@@ -1269,6 +1292,15 @@ def main():
                          "choose options >= this width and the DP compensates by "
                          "lowering non-expert widths. 2 = no floor (default). "
                          "Note: a floor can make a low target infeasible.")
+    ap.add_argument("--quantize-embeddings", action="store_true",
+                    help="Dense models: quantize embed_tokens/lm_head through the "
+                         "DP instead of keeping them BF16. Needed to compare "
+                         "against checkpoints that quantize embeddings (e.g. "
+                         "MACaQ) at matched file size.")
+    ap.add_argument("--embedding-min-bits", type=int, default=2,
+                    help="Minimum bitwidth for embedding groups when "
+                         "--quantize-embeddings is set (default 2 = no floor; "
+                         "4 is safer for tied output projections).")
     ap.add_argument("--imatrix", default=None,
                     help="Path to a GGUF imatrix file or local .npz; weights the "
                          "error DB per input column by activation importance")
@@ -1352,6 +1384,17 @@ def main():
         from rco_mlx.adapters import get as _get
         model_adapter = _get("default")()
         print("Dense model detected — using the generic default adapter.")
+
+    if args.quantize_embeddings:
+        if not hasattr(model_adapter, "quantize_embeddings"):
+            sys.exit(
+                "--quantize-embeddings requires an adapter that supports it "
+                "(the dense default adapter does; MoE adapters do not)."
+            )
+        model_adapter.quantize_embeddings = True
+        print("Embedding/lm_head quantization: enabled")
+
+    quantize_embeddings = bool(getattr(model_adapter, "quantize_embeddings", False))
 
     # --- Step 1: introspect ---
     print("[1/5] introspecting model …")
@@ -1561,6 +1604,8 @@ def main():
                 group_is_expert=[
                     expert_group_key(n) is not None for n in c_names
                 ],
+                group_is_embedding=[_is_embedding_name(n) for n in c_names],
+                embedding_min_bits=args.embedding_min_bits,
             )
             assignment = {
                 group_names[i]: c_assignment[c_names[j]]
@@ -1576,6 +1621,8 @@ def main():
                 group_is_expert=[
                     expert_group_key(n) is not None for n in group_names
                 ],
+                group_is_embedding=[_is_embedding_name(n) for n in group_names],
+                embedding_min_bits=args.embedding_min_bits,
             )
         print(f"  achieved {report['achieved_bpw']:.4f} bpw")
         print(f"  histogram: {report['bit_histogram']}")
@@ -1687,6 +1734,7 @@ def main():
         assignment, args.group_size, source, output, args.default_bits,
         quant_mode=args.quant_mode, bf16_prefixes=bf16_prefixes,
         group_size_map=group_size_map or None,
+        quantize_embeddings=quantize_embeddings,
     )
 
     # --- Step 5: quantize ---

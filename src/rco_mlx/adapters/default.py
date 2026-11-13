@@ -32,6 +32,12 @@ class DefaultAdapter(ModelAdapter):
     default_group_size = 64
     default_bits = 4
 
+    # Quantize the token embedding / lm_head like any other projection.
+    # Off by default: most RCO comparisons keep embeddings exact, and the
+    # embedding dominates small-vocab checkpoint size. When on, the DP
+    # allocates its bitwidth (subject to ``embedding_min_bits``).
+    quantize_embeddings = False
+
     _BF16_PREFIXES = (
         "embed_tokens",
         "lm_head",
@@ -82,7 +88,10 @@ class DefaultAdapter(ModelAdapter):
         return None
 
     def non_quantized_prefixes(self) -> List[str]:
-        return list(self._BF16_PREFIXES)
+        prefixes: List[str] = list(self._BF16_PREFIXES)
+        if self.quantize_embeddings:
+            prefixes = [p for p in prefixes if p not in ("embed_tokens", "lm_head")]
+        return prefixes
 
     def load_calibration(
         self,
