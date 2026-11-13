@@ -56,6 +56,12 @@ __all__ = [
 _HF_EXPERT_RE = re.compile(
     r"layers\.(\d+)\.(?:mlp|feed_forward)\.experts\.(\d+)\.([A-Za-z0-9_]+)"
 )
+# Granite-4.0-H stores the routed experts pre-stacked (no per-expert index):
+#   layers.{L}.block_sparse_moe.input_linear  ([E, 2*hidden, in], gate+up)
+#   layers.{L}.block_sparse_moe.output_linear ([E, in, hidden], down)
+_HF_GRANITE_EXPERT_RE = re.compile(
+    r"layers\.(\d+)\.block_sparse_moe\.(input_linear|output_linear)"
+)
 # MLX stacked names: ...switch_mlp.{projection} (single tensor per layer)
 _MLX_STACKED_RE = re.compile(
     r"layers\.(\d+)\..*switch_(?:mlp|glu)\.([A-Za-z0-9_]+)"
@@ -103,6 +109,7 @@ def is_expert_name(name: str) -> bool:
         return False
     return bool(
         _HF_EXPERT_RE.search(name)
+        or _HF_GRANITE_EXPERT_RE.search(name)
         or _MLX_STACKED_RE.search(name)
         or _MLX_FEED_FORWARD_RE.search(name)
     )
@@ -119,6 +126,9 @@ def expert_group_key(name: str) -> Optional[Tuple[int, str]]:
     m = _HF_EXPERT_RE.search(name)
     if m:
         return int(m.group(1)), m.group(3)
+    m = _HF_GRANITE_EXPERT_RE.search(name)
+    if m:
+        return int(m.group(1)), m.group(2)
     m = _MLX_STACKED_RE.search(name)
     if m:
         return int(m.group(1)), m.group(2)

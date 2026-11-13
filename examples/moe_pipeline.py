@@ -1047,7 +1047,7 @@ def _rewrite_config_mlx_keys(output_dir: Path, model_adapter, quant_mode: str = 
 # MoE auto-detection
 # ---------------------------------------------------------------------------
 
-_MOE_ADAPTERS = {"olmoe", "qwen3_5_moe", "qwen4_exp", "lfm2_moe"}
+_MOE_ADAPTERS = {"olmoe", "qwen3_5_moe", "qwen4_exp", "lfm2_moe", "granitemoehybrid"}
 
 
 def detect_moe_model(source_dir: Path, model_type: str | None) -> bool:
@@ -1732,6 +1732,80 @@ def main():
         cfg_data["quantization"] = final_qc
         cfg_path.write_text(json.dumps(cfg_data, indent=2))
         print(f"  config rewritten ({len(qc)} -> {len(final_qc)} entries)")
+
+    # Post-process: Granite-4.0-H hybrid MoE.
+    # Two things mlx_lm's granitemoehybrid.sanitize cannot do for a quantized
+    # checkpoint:
+    #   1. The pipeline's 3-D path quantizes the flat [E*out, in] tensor, so
+    #      scales/biases come out 2-D [E*out, in/gs]; mx.quantize on the 3-D
+    #      weight produces [E, out, in/gs], which is what gather_qmm expects.
+    #   2. mlx_lm's sanitize splits block_sparse_moe.input_linear into
+    #      switch_mlp.gate_proj + up_proj (dim 1) and renames output_linear to
+    #      down_proj. The adapter maps input_linear to the gate_proj carrier,
+    #      so split it here and declare the up_proj module.
+    if args.model_type == "granitemoehybrid":
+        print("[post] reshaping Granite switch_mlp scales + splitting gate/up ...")
+        import os
+
+        import safetensors.torch as st
+        import torch
+
+        n_reshaped = 0
+        n_split = 0
+        for shard_path in sorted(output.glob("*.safetensors")):
+            tensors = st.load_file(str(shard_path))
+            new_tensors = dict(tensors)
+            for key in list(new_tensors.keys()):
+                if ".switch_mlp." not in key or not key.endswith(".scales"):
+                    continue
+                base = key[: -len(".scales")]
+                wkey = base + ".weight"
+                if wkey not in new_tensors:
+                    continue
+                w = new_tensors[wkey]
+                if w.dim() != 3:
+                    continue
+                E, out, _ = w.shape
+                s = new_tensors[key]
+                if s.dim() == 2 and s.shape[0] == E * out:
+                    new_tensors[key] = s.reshape(E, out, s.shape[-1]).contiguous()
+                    bkey = base + ".biases"
+                    if bkey in new_tensors and new_tensors[bkey].dim() == 2:
+                        b = new_tensors[bkey]
+                        if b.shape[0] == E * out:
+                            new_tensors[bkey] = b.reshape(E, out, b.shape[-1]).contiguous()
+                    n_reshaped += 1
+                else:
+                    continue
+                if not base.endswith(".gate_proj"):
+                    continue
+                up_base = base[: -len(".gate_proj")]
+                h = new_tensors[wkey].shape[1] // 2
+                new_tensors[wkey] = new_tensors[wkey][:, :h, :].contiguous()
+                new_tensors[up_base + ".up_proj.weight"] = w[:, h:, :].contiguous()
+                for suf in ("scales", "biases"):
+                    sk = base + "." + suf
+                    if sk in new_tensors:
+                        sv = new_tensors[sk]
+                        new_tensors[sk] = sv[:, :h, :].contiguous()
+                        new_tensors[up_base + ".up_proj." + suf] = sv[:, h:, :].contiguous()
+                n_split += 1
+            tmp_path = "/tmp/" + shard_path.name + ".tmp"
+            st.save_file(new_tensors, tmp_path)
+            os.replace(tmp_path, str(shard_path))
+        print(f"  reshaped {n_reshaped} scale tensors, split {n_split} gate/up carriers")
+
+        cfg_path = output / "config.json"
+        cfg_data = json.loads(cfg_path.read_text())
+        qc = cfg_data.get("quantization", {})
+        final_qc = dict(qc)
+        for key, val in qc.items():
+            if key.endswith(".switch_mlp.gate_proj"):
+                final_qc[key[: -len("gate_proj")] + "up_proj"] = dict(val)
+        cfg_data["quantization"] = final_qc
+        cfg_data["quantization_config"] = final_qc
+        cfg_path.write_text(json.dumps(cfg_data, indent=2))
+        print(f"  config updated ({len(qc)} -> {len(final_qc)} entries)")
 
     print(f"Config: {output / 'config.json'}")
     print(f"{'='*60}")
