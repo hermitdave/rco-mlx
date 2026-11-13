@@ -84,6 +84,18 @@ def main():
     in_sum2: dict[str, np.ndarray] = {}
     counts: dict[str, float] = {}
 
+    def to_np(a):
+        """``np.asarray`` that copes with bfloat16 mlx arrays.
+
+        PEP 3118 has no bfloat16 format string, so ``np.asarray`` on a bf16
+        mlx array raises ValueError. Models with BF16 weights (LFM2.5) hit
+        this; FP32-weight models (OLMoE) never did.
+        """
+        try:
+            return np.asarray(a)
+        except ValueError:
+            return np.asarray(a.astype(mx.float32))
+
     def accumulate(key: str, rows: np.ndarray):
         if rows.size == 0:
             return
@@ -117,17 +129,17 @@ def main():
         info = hook_by_id.get(id(self))
         if info is not None:
             try:
-                accumulate(info[1], np.asarray(x))
-            except Exception:
-                pass
+                accumulate(info[1], to_np(x))
+            except Exception as exc:  # noqa: BLE001 - surface, don't swallow
+                print(f"  [hook] linear {info[1]}: {type(exc).__name__}: {exc}", flush=True)
         return patched_types[type(self)](self, x, *a, **kw)
 
     def switch_call(self, x, indices=None, *a, **kw):
         info = hook_by_id.get(id(self))
         if info is not None:
             try:
-                x_np = np.asarray(x)
-                idx_np = np.asarray(indices) if indices is not None else None
+                x_np = to_np(x)
+                idx_np = to_np(indices) if indices is not None else None
                 if idx_np is not None:
                     # SwitchGLU expands x to [tokens, 1, 1, D] and passes
                     # indices [tokens, top_k]; each token's row feeds all
@@ -145,8 +157,8 @@ def main():
                             )
                 else:
                     accumulate(f"{info[1]}.weight", x_np)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - surface, don't swallow
+                print(f"  [hook] switch {info[1]}: {type(exc).__name__}: {exc}", flush=True)
         orig = patched_types[type(self)]
         return orig(self, x, indices, *a, **kw) if indices is not None else orig(self, x, *a, **kw)
 

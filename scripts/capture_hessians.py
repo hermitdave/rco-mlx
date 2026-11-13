@@ -109,12 +109,19 @@ def main() -> None:
 
     state = {"targets": {}, "hess": {}, "counts": {}}
 
+    def to_np(a):
+        """``np.asarray`` that copes with bfloat16 mlx arrays (no PEP 3118 bf16)."""
+        try:
+            return np.asarray(a)
+        except ValueError:
+            return np.asarray(a.astype(mx.float32))
+
     def switch_call(self, x, indices=None, *a, **kw):
         path = id_of.get(id(self))
         if path is not None and path in state["targets"]:
             try:
-                x_np = np.asarray(x)
-                idx_np = np.asarray(indices) if indices is not None else None
+                x_np = to_np(x)
+                idx_np = to_np(indices) if indices is not None else None
                 x2 = x_np.reshape(-1, x_np.shape[-1]).astype(np.float32)
                 k = idx_np.shape[1] if idx_np.ndim == 2 else 1
                 idx_flat = idx_np.reshape(-1)
