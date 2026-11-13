@@ -127,6 +127,25 @@ rewrite; no re-quantization is needed.
    +0.005 KL — so at 4.5 bpw the RCO build trades ~6% more bytes than MACaQ
    for slightly worse PPL but faster decoding and better task recovery.
 
+## Compute cost (M3 Max, LFM3-1.7B)
+
+Reconstructed from filesystem timestamps (stage artifacts) and the MACaQ
+refine logs. RCO's error DB and imatrix are one-time costs that are reused
+across targets: seven pipeline runs in this session took ~10 minutes total.
+
+| Step | RCO (this work) | MACaQ (logs) |
+|---|---|---|
+| Base quant | RTN inside the pipeline (included below) | mxfp4 conversion, ~1–2 min (not precisely logged) |
+| Sensitivity capture | error DB 13–31 s (reusable) | Hessian capture 20.3 s + calibration build |
+| Importance / refinement | imatrix capture ~30 s (reusable) | per-tensor flip refinement |
+| Quantize / pack | 44 s (includes per-group clip search) | included in refine |
+| **End-to-end, one checkpoint** | **~1 min 45 s** with imatrix capture; **~57 s** reusing cached DB+imatrix | **~6 min** at flips=64 (measured 6:19, 30.9% Hessian reduction); **~11–12 min** at the shipped flips=256 (inferred from the 35-min 3-budget flip sweep, f512 alone ≈17 min) |
+
+So RCO is roughly **6–20× faster per checkpoint**, and its reusable error DB
+makes re-allocation at a new target a ~1-minute quantize-only operation. The
+trade is what the time buys: MACaQ's extra minutes purchase Hessian-based
+code refinement that RCO's RTN+per-group-clip pipeline does not attempt.
+
 ## Reproduce
 
 ```bash
