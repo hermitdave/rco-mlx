@@ -1658,6 +1658,60 @@ def main():
             cfg_data["quantization"] = final_qc
             cfg_path.write_text(json.dumps(cfg_data, indent=2))
             print("  config updated")
+    # Post-process: LFM2/LFM2.5 expert stacking.
+    # mlx_lm's lfm2_moe.sanitize stacks only `.weight` for
+    # feed_forward.experts.E.*, leaving the quantized `.scales`/`.biases`
+    # behind as "parameters not in model" (OLMoE's sanitize stacks all
+    # three). Stack every suffix ourselves so the checkpoint loads with a
+    # stock mlx_lm.
+    if args.model_type == "lfm2_moe":
+        print("[post] stacking LFM2 per-expert tensors into switch_mlp ...")
+        import os
+        import re
+
+        import safetensors.torch as st
+        import torch
+
+        cfg_data = json.loads((source / "config.json").read_text())
+        num_layers = int(cfg_data["num_hidden_layers"])
+        num_experts = int(cfg_data["num_experts"])
+        n_stacked = 0
+        for shard_path in sorted(output.glob("*.safetensors")):
+            tensors = st.load_file(str(shard_path))
+            new_tensors = dict(tensors)
+            for l in range(num_layers):
+                prefix = f"model.layers.{l}.feed_forward"
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    for suffix in ("weight", "scales", "biases"):
+                        keys = [f"{prefix}.experts.{e}.{proj}.{suffix}"
+                                for e in range(num_experts)]
+                        if not all(k in new_tensors for k in keys):
+                            continue
+                        vals = [new_tensors.pop(k) for k in keys]
+                        new_tensors[f"{prefix}.switch_mlp.{proj}.{suffix}"] = \
+                            torch.stack(vals, dim=0).contiguous()
+                        n_stacked += 1
+            tmp_path = "/tmp/" + shard_path.name + ".tmp"
+            st.save_file(new_tensors, tmp_path)
+            os.replace(tmp_path, str(shard_path))
+            print(f"  stacked {shard_path.name} ({n_stacked} tensors)")
+
+        # Rewrite config keys to the stacked form. Uniformity within each
+        # (layer, projection) means every expert carries the same spec, so
+        # collapsing the per-expert entries is lossless.
+        cfg_path = output / "config.json"
+        cfg_data = json.loads(cfg_path.read_text())
+        qc = cfg_data.get("quantization", {})
+        final_qc = {}
+        for k, v in qc.items():
+            nk = re.sub(r"\.experts\.\d+\.", ".switch_mlp.", k)
+            if nk in final_qc and final_qc[nk] != v:
+                print(f"  warning: conflicting quantization spec for {nk}")
+            final_qc[nk] = v
+        cfg_data["quantization"] = final_qc
+        cfg_path.write_text(json.dumps(cfg_data, indent=2))
+        print(f"  config rewritten ({len(qc)} -> {len(final_qc)} entries)")
+
     print(f"Config: {output / 'config.json'}")
     print(f"{'='*60}")
 
