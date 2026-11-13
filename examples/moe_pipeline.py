@@ -268,7 +268,7 @@ def load_error_db(path: Path, group_names: list | None = None) -> tuple[np.ndarr
         for name in group_names:
             row = by_name.get(name) or by_name.get(name + ".weight")
             if row is None:
-                m = _re.match(r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.mlp\.experts)\.\d+\.([a-z_]+)$", name)
+                m = _re.match(r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.(?:mlp|feed_forward)\.experts)\.\d+\.([a-z_]+)$", name)
                 if m:
                     row = by_name.get(f"{m.group(1)}.{m.group(2)}")
             if row is None:
@@ -789,7 +789,9 @@ def stream_quantize(
                 try:
                     experts_idx = parts.index("experts")
                     proj = parts[experts_idx + 2]
-                    l = parts[3]
+                    # layer index follows the "layers" component in both
+                    # model.layers.N.* and model.language_model.layers.N.*
+                    l = parts[parts.index("layers") + 1]
                     for prefix in ["feed_forward", "mlp"]:
                         stacked_key = f"model.layers.{l}.{prefix}.{proj}"
                         if stacked_key in layer_bits:
@@ -1040,7 +1042,7 @@ def _rewrite_config_mlx_keys(output_dir: Path, model_adapter, quant_mode: str = 
 # MoE auto-detection
 # ---------------------------------------------------------------------------
 
-_MOE_ADAPTERS = {"olmoe", "qwen3_5_moe", "qwen4_exp"}
+_MOE_ADAPTERS = {"olmoe", "qwen3_5_moe", "qwen4_exp", "lfm2_moe"}
 
 
 def detect_moe_model(source_dir: Path, model_type: str | None) -> bool:

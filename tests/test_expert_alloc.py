@@ -29,6 +29,21 @@ def test_group_key_hf_per_expert_names():
     assert expert_group_key(HF_DOWN.format(l=3, e=17)) == (3, "down_proj")
 
 
+def test_group_key_lfm2_feed_forward_experts():
+    """LFM2/LFM2.5 keep experts under feed_forward.experts with w1/w2/w3 names."""
+    assert expert_group_key(
+        "model.layers.2.feed_forward.experts.0.w1") == (2, "w1")
+    assert expert_group_key(
+        "model.layers.2.feed_forward.experts.7.w2") == (2, "w2")
+    assert expert_group_key(
+        "model.layers.21.feed_forward.experts.31.w3") == (21, "w3")
+    # the mlx_lm stacked form must land on the same (layer, projection) family
+    assert expert_group_key(
+        "model.layers.2.feed_forward.switch_mlp.gate_proj") == (2, "gate_proj")
+    # dense layers have no experts
+    assert not is_expert_name("model.layers.0.feed_forward.w1")
+
+
 def test_group_key_mlx_stacked_names():
     assert expert_group_key(MLX_GATE.format(l=11)) == (11, "gate_proj")
     assert expert_group_key(MLX_DOWN.format(l=11)) == (11, "down_proj")

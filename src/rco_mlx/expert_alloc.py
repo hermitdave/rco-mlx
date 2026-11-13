@@ -52,16 +52,19 @@ __all__ = [
 ]
 
 # HF per-expert names: ...layers.{L}.mlp.experts.{E}.{projection}
+# (LFM2/LFM2.5 use feed_forward.experts instead of mlp.experts)
 _HF_EXPERT_RE = re.compile(
-    r"layers\.(\d+)\.mlp\.experts\.(\d+)\.([A-Za-z0-9_]+)"
+    r"layers\.(\d+)\.(?:mlp|feed_forward)\.experts\.(\d+)\.([A-Za-z0-9_]+)"
 )
 # MLX stacked names: ...switch_mlp.{projection} (single tensor per layer)
 _MLX_STACKED_RE = re.compile(
     r"layers\.(\d+)\..*switch_(?:mlp|glu)\.([A-Za-z0-9_]+)"
 )
 # Some writers use feed_forward. instead of mlp. for the stacked tensor.
+# Must require the stacked `switch_` segment, otherwise a dense layer's
+# `feed_forward.w1` is misread as an expert (LFM2 has dense layers 0..N).
 _MLX_FEED_FORWARD_RE = re.compile(
-    r"layers\.(\d+)\.feed_forward\.([A-Za-z0-9_]+)"
+    r"layers\.(\d+)\.feed_forward\.switch_(?:mlp|glu)\.([A-Za-z0-9_]+)"
 )
 
 # --- Measured UD-IQ2_XS recipe (Qwen3.8-Flash-Next, qwen4_exp) -----------
