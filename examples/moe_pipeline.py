@@ -647,9 +647,37 @@ def stream_quantize(
     clip_grid=PER_GROUP_CLIP_GRID,
     clip_max_bits: int = 8,
     hessian_dir: Path | None = None,
+    scale_dtype: str = "float16",
 ):
-    """Stream through BF16 source, quantize per allocation, write shards."""
+    """Stream through BF16 source, quantize per allocation, write shards.
+
+    ``scale_dtype`` selects the storage dtype for affine scales/biases. The
+    default (float16) keeps the most precision, but MLX's dequant kernel
+    consumes bfloat16 scales natively -- measured on Granite-4.0-H-Tiny,
+    float16 scales cost ~1.9x decode throughput for a negligible quality
+    difference (KL 0.0682 -> 0.0689). Use ``"bfloat16"`` when decode speed
+    matters more than the extra mantissa bits.
+    """
     import torch
+
+    def _to_scale(arr: np.ndarray, dtype: str):
+        if dtype == "bfloat16":
+            return torch.from_numpy(arr.astype(np.float32)).to(torch.bfloat16)
+        np_dt = {"float16": np.float16, "float32": np.float32}[dtype]
+        return torch.from_numpy(arr.astype(np_dt))
+
+    def _store_scales(results, base_key, scales_np, biases_np, quant_mode):
+        if quant_mode == "symmetric":
+            results[f"{base_key}.scales"] = _to_scale(scales_np, scale_dtype)
+            return
+        dtype = scale_dtype
+        if dtype == "float16" and (
+            np.max(np.abs(scales_np)) > 65504 or np.max(np.abs(biases_np)) > 65504
+        ):
+            print(f"  {base_key}: overflow -> float32 scales/biases")
+            dtype = "float32"
+        results[f"{base_key}.scales"] = _to_scale(scales_np, dtype)
+        results[f"{base_key}.biases"] = _to_scale(biases_np, dtype)
 
     from rco_mlx.mlx_alloc import MlxQuantConfig
 
@@ -885,20 +913,7 @@ def stream_quantize(
                         results[mlx_key] = torch.from_numpy(np.array(q).astype(np.uint32))
                         scales_np = np.array(scales)
                         biases_np = np.array(biases)
-                        if quant_mode == "symmetric":
-                            results[f"{base_key}.scales"] = torch.from_numpy(scales_np.astype(np.float16))
-                        else:
-                            use_fp16 = (
-                                np.max(np.abs(scales_np)) <= 65504
-                                and np.max(np.abs(biases_np)) <= 65504
-                            )
-                            if use_fp16:
-                                results[f"{base_key}.scales"] = torch.from_numpy(scales_np.astype(np.float16))
-                                results[f"{base_key}.biases"] = torch.from_numpy(biases_np.astype(np.float16))
-                            else:
-                                print(f"  {base_key}: overflow -> float32 scales/biases")
-                                results[f"{base_key}.scales"] = torch.from_numpy(scales_np.astype(np.float32))
-                                results[f"{base_key}.biases"] = torch.from_numpy(biases_np.astype(np.float32))
+                        _store_scales(results, base_key, scales_np, biases_np, quant_mode)
                     elif tensor.ndim == 3:
                         # Stacked MoE expert tensor: quantize ALL experts in batch
                         E, H, I = tensor.shape
@@ -926,20 +941,7 @@ def stream_quantize(
                         biases_np = np.array(biases_flat)
                         base_key = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
 
-                        if quant_mode == "symmetric":
-                            results[f"{base_key}.scales"] = torch.from_numpy(scales_np.astype(np.float16))
-                        else:
-                            use_fp16 = (
-                                np.max(np.abs(scales_np)) <= 65504
-                                and np.max(np.abs(biases_np)) <= 65504
-                            )
-                            if use_fp16:
-                                results[f"{base_key}.scales"] = torch.from_numpy(scales_np.astype(np.float16))
-                                results[f"{base_key}.biases"] = torch.from_numpy(biases_np.astype(np.float16))
-                            else:
-                                print(f"  {base_key}: overflow -> float32 scales/biases")
-                                results[f"{base_key}.scales"] = torch.from_numpy(scales_np.astype(np.float32))
-                                results[f"{base_key}.biases"] = torch.from_numpy(biases_np.astype(np.float32))
+                        _store_scales(results, base_key, scales_np, biases_np, quant_mode)
                     else:
                         results[mlx_key] = tensor.to(torch.bfloat16)
                 else:
@@ -1223,6 +1225,11 @@ def main():
                          "OLMoE @2.5: gating to <=3 bits is WORSE (KL 0.466 vs "
                          "0.452) because the weighted search also helps at 4/8-bit, "
                          "so the default stays 8")
+    ap.add_argument("--scale-dtype", choices=["float16", "bfloat16"], default="float16",
+                    help="Storage dtype for affine scales/biases. bfloat16 is "
+                         "consumed natively by MLX's dequant kernel (~1.9x faster "
+                         "decode, measured on Granite-4.0-H-Tiny) at a small "
+                         "precision cost; float16 keeps more mantissa bits.")
     ap.add_argument("--per-tensor-group-size", action="store_true",
                     help="Assign per-tensor group sizes from measured "
                          "sensitivity (top-quartile -> gs32, bottom-half -> "
@@ -1600,7 +1607,7 @@ def main():
         group_size_map=group_size_map or None, clip_map=clip_map or None,
         imatrix_path=imatrix_path, per_group_clip=args.per_group_clip,
         clip_grid=clip_grid, clip_max_bits=args.clip_max_bits,
-        hessian_dir=args.hessian_dir,
+        hessian_dir=args.hessian_dir, scale_dtype=args.scale_dtype,
     )
 
     # Post-process: apply Qwen3.5 sanitize for quantized weights
