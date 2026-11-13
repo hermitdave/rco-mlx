@@ -1088,6 +1088,7 @@ def build_calibration_from_dataset(
     dataset: str,
     num_samples: int = 128,
     seq_length: int = 2048,
+    add_bos: bool = False,
 ) -> Path:
     from transformers import AutoTokenizer
 
@@ -1126,6 +1127,15 @@ def build_calibration_from_dataset(
     else:
         all_ids = all_ids[:target]
 
+    # Some tokenizers (LFM2.5) define a bos_token_id but do not add it in
+    # encode(), and the model is lost without it (wikitext PPL 210 vs ~12).
+    bos = getattr(tokenizer, "bos_token_id", None)
+    if add_bos and bos is not None:
+        per = seq_length - 1
+        rows = [all_ids[i * per:(i + 1) * per] for i in range(num_samples)]
+        all_ids = [t for row in rows for t in [bos, *row]]
+        print(f"[calib] prepending bos {bos} to each sample")
+
     ids_np = np.array(all_ids, dtype=np.int32).reshape(num_samples, seq_length)
     out = source_dir / "work" / f"calib_{dataset}_{num_samples}x{seq_length}.npy"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1150,6 +1160,11 @@ def main():
     ap.add_argument("--model-type", default=None, help="Model adapter (olmoe, qwen3_5_moe)")
     ap.add_argument("--calibration", default=None, help="Path to calibration .npy")
     ap.add_argument("--calibration-dataset", default=None, help="Auto-generate calib: wikitext|fineweb|c4")
+    ap.add_argument("--calibration-bos", action="store_true",
+                    help="Prepend the tokenizer's bos_token_id to each calibration "
+                         "sample. Needed when the tokenizer defines a bos but does "
+                         "not add it in encode() and the model is lost without it "
+                         "(LFM2.5: wikitext PPL 210 without vs ~12 with).")
     ap.add_argument("--error-db", default=None, help="Pre-built error_db.json")
     ap.add_argument("--bits", default="2,3,4,6,8", help="Bitwidths to sweep")
     ap.add_argument("--quant-mode", default="affine", choices=["affine", "symmetric"],
@@ -1379,6 +1394,7 @@ def main():
                     source_dir=source,
                     model_type=args.model_type or "default",
                     dataset=args.calibration_dataset,
+                    add_bos=args.calibration_bos,
                 )
             else:
                 sys.exit("Need --calibration, --calibration-dataset, or --error-db")
