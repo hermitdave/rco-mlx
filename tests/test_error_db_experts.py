@@ -22,6 +22,12 @@ _spec.loader.exec_module(_mod)
         # Qwen3.5 / Qwen4-Exp: model.language_model.layers.N...
         ("model.language_model.layers.3.mlp.experts.17.gate_up_proj.weight",
          "model.language_model.layers.3.mlp.experts.gate_up_proj"),
+        # LFM2/LFM2.5: feed_forward.experts with SwiGLU w1/w2/w3 names.
+        # The projection class must include digits -- `w1` is not `[a-z_]+`.
+        ("model.layers.2.feed_forward.experts.0.w1.weight",
+         "model.layers.2.feed_forward.experts.w1"),
+        ("model.layers.21.feed_forward.experts.31.w3.weight",
+         "model.layers.21.feed_forward.experts.w3"),
     ],
 )
 def test_expert_row_key_aggregates(key, expected):

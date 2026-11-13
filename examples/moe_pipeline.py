@@ -268,7 +268,7 @@ def load_error_db(path: Path, group_names: list | None = None) -> tuple[np.ndarr
         for name in group_names:
             row = by_name.get(name) or by_name.get(name + ".weight")
             if row is None:
-                m = _re.match(r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.(?:mlp|feed_forward)\.experts)\.\d+\.([a-z_]+)$", name)
+                m = _re.match(r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.(?:mlp|feed_forward)\.experts)\.\d+\.([a-z0-9_]+)$", name)
                 if m:
                     row = by_name.get(f"{m.group(1)}.{m.group(2)}")
             if row is None:

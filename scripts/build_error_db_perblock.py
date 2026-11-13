@@ -38,7 +38,7 @@ SKIP_PREFIXES = ("mtp.",)  # MTP head -- BF16 preserved
 
 EXPERT_RE = re.compile(
     r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.(?:mlp|feed_forward)\.experts)"
-    r"\.\d+\.([a-z_]+)\.weight$"
+    r"\.\d+\.([a-z0-9_]+)\.weight$"
 )
 
 

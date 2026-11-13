@@ -79,8 +79,27 @@ _ATTN_PATTERNS = [
 
 
 def _expert_index(hf_key: str) -> Optional[int]:
-    m = re.search(r"\.mlp\.experts\.(\d+)\.", hf_key)
+    m = re.search(r"\.(?:mlp|feed_forward)\.experts\.(\d+)\.", hf_key)
     return int(m.group(1)) if m else None
+
+
+# SwiGLU projection spellings differ by checkpoint family: LFM2 stores
+# w1/w2/w3, OLMoE/Qwen store gate_proj/down_proj/up_proj.
+_SWIGLU_RENAME = {
+    "w1.weight": "gate_proj.weight",
+    "w2.weight": "down_proj.weight",
+    "w3.weight": "up_proj.weight",
+}
+
+
+def _hf_key_candidates(hf_key: str) -> Iterable[str]:
+    """Yield ``hf_key`` plus its SwiGLU projection-name variants."""
+    yield hf_key
+    for old, new in _SWIGLU_RENAME.items():
+        if old in hf_key:
+            yield hf_key.replace(old, new)
+        elif new in hf_key:
+            yield hf_key.replace(new, old)
 
 
 def hf_key_to_gguf(hf_key: str) -> Optional[Tuple[str, Optional[int]]]:
@@ -165,15 +184,23 @@ class Imatrix:
         (1.0 for non-experts) -- the correct aggregation weight for
         expert rows in the error DB. Returns ``None`` if unmapped.
         """
-        # Local NPZ captures are keyed by HF tensor name directly.
-        if self._npz is not None and f"{hf_key}.in_sum2" in self._names:
-            col = self._get(f"{hf_key}.in_sum2").reshape(-1).astype(np.float64)
-            counts = (
-                self._get(f"{hf_key}.counts").reshape(-1).astype(np.float64)
-                if f"{hf_key}.counts" in self._names
-                else np.array([1.0])
-            )
-            return _normalise_columns(col, counts, _expert_index(hf_key))
+        # Local NPZ captures are keyed by HF tensor name directly. The capture
+        # maps MLX stacked names back to HF, but SwiGLU projections are named
+        # w1/w2/w3 in some checkpoints (LFM2) and gate_proj/down_proj/up_proj
+        # in others (OLMoE, Qwen) -- try both spellings.
+        if self._npz is not None:
+            names = self._names
+            assert names is not None
+            for candidate in _hf_key_candidates(hf_key):
+                if f"{candidate}.in_sum2" not in names:
+                    continue
+                col = self._get(f"{candidate}.in_sum2").reshape(-1).astype(np.float64)
+                counts = (
+                    self._get(f"{candidate}.counts").reshape(-1).astype(np.float64)
+                    if f"{candidate}.counts" in names
+                    else np.array([1.0])
+                )
+                return _normalise_columns(col, counts, _expert_index(hf_key))
 
         mapped = hf_key_to_gguf(hf_key)
         if mapped is None:

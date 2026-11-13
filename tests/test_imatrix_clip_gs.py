@@ -25,6 +25,22 @@ def test_hf_key_to_gguf_experts_and_attention():
     assert hf_key_to_gguf("model.layers.1.mlp.gate.weight") is None
 
 
+def test_lfm2_feed_forward_expert_naming():
+    """LFM2 stores SwiGLU as w1/w2/w3 under feed_forward.experts."""
+    from rco_mlx.imatrix import _expert_index, _hf_key_candidates
+
+    assert _expert_index("model.layers.2.feed_forward.experts.7.w1.weight") == 7
+    assert _expert_index("model.layers.2.mlp.experts.7.gate_proj.weight") == 7
+    assert _expert_index("model.layers.2.self_attn.q_proj.weight") is None
+
+    # the capture writes gate_proj names; the checkpoint stores w1 -- both
+    # spellings must resolve to the same entry
+    cands = list(_hf_key_candidates("model.layers.2.feed_forward.experts.0.w1.weight"))
+    assert "model.layers.2.feed_forward.experts.0.gate_proj.weight" in cands
+    cands = list(_hf_key_candidates("model.layers.2.mlp.experts.0.gate_proj.weight"))
+    assert "model.layers.2.mlp.experts.0.w1.weight" in cands
+
+
 def test_imatrix_npz_roundtrip_weighting(tmp_path):
     path = tmp_path / "imatrix.npz"
     # Per-expert NPZ layout: one [in] vector per HF tensor.
