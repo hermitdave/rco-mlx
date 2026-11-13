@@ -144,8 +144,20 @@ def budget_dp(
             f"{int(per_group_min.sum())} units."
         )
 
-    # Prefer the full budget; fall back to the nearest reachable value below it.
-    best_j = budget if finite[budget] else int(np.max(np.nonzero(finite)[0]))
+    # Pick the highest-value reachable cost at or under budget.
+    #
+    # The previous behaviour restricted the search to the LARGEST reachable
+    # cost, on the theory that spending the full budget is always best. That
+    # is false: the exact-cost constraint at the top of the budget can force a
+    # bad combination. Measured on LFM2.5-8B-A1B at target 4.25, the DP chose
+    # cost 42500 (total loss 2.20e-3) when cost 42419 gave 6.07e-4 -- 3.6x
+    # better for 0.008 bpw less, and better than the 4.0 bpw run's 7.74e-4.
+    # The knapsack optimum is the max over all j <= budget.
+    finite = np.isfinite(dp)
+    best_value = float(dp[finite].max())
+    # Among the costs achieving the best value, take the largest: when two
+    # assignments tie on quality, spend the budget rather than undershoot it.
+    best_j = int(np.max(np.nonzero(finite & (dp >= best_value - 1e-12))[0]))
 
     assignment = np.zeros(n_groups, dtype=np.int64)
     j = best_j

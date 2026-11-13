@@ -14,12 +14,12 @@ from rco_mlx.search import ProjectedGumbelOptimizer, budget_dp, values_from_loss
 
 
 def _brute_force(values, fracs, actual_bits, target, resolution=10000):
-    """Replicate ``round_with_budget_dp``'s semantics exactly.
+    """Replicate ``budget_dp``'s semantics exactly.
 
-    The DP does *not* maximize value over all feasible budgets. It takes the
-    largest reachable total cost ``best_j <= budget``, then the highest-value
-    assignment among those costing exactly ``best_j``. The brute force has to
-    match that, or it is checking a different objective.
+    The DP maximises total value over every assignment whose total cost is
+    ``<= budget`` -- NOT just the largest reachable cost. Restricting to the
+    largest reachable cost is a different (and worse) objective; see
+    ``test_budget_dp_prefers_best_value_over_largest_cost``.
     """
     n_groups, n_options = values.shape
     budget = int(round(target * resolution))
@@ -27,18 +27,11 @@ def _brute_force(values, fracs, actual_bits, target, resolution=10000):
 
     combos = list(itertools.product(range(n_options), repeat=n_groups))
 
-    reachable = set()
-    for combo in combos:
-        total = sum(int(costs[g, combo[g]]) for g in range(n_groups))
-        if total <= budget:
-            reachable.add(total)
-    best_j = max(reachable)
-
     best_value = -np.inf
     best_assignment = None
     for combo in combos:
         total = sum(int(costs[g, combo[g]]) for g in range(n_groups))
-        if total != best_j:
+        if total > budget:
             continue
         value = sum(values[g, combo[g]] for g in range(n_groups))
         if value > best_value:
@@ -60,6 +53,21 @@ def test_budget_dp_matches_brute_force():
         got = budget_dp(values, fracs, actual_bits, target)
         expected, _ = _brute_force(values, fracs, actual_bits, target)
         assert tuple(got) == tuple(expected), f"target={target}: {got} != {expected}"
+
+
+def test_budget_dp_prefers_best_value_over_largest_cost():
+    """The DP must maximise value over ALL costs <= budget, not the largest one.
+
+    Regression: the old code restricted to the largest reachable cost, so at
+    budget 3.01 it picked the cost-3.01 assignment (value -1000) over the
+    cost-3.00 one (value 0). Found on LFM2.5-8B-A1B at target 4.25, where the
+    largest-cost assignment carried 3.6x the loss of a 0.008-bpw-cheaper one.
+    """
+    values = np.array([[0.0, -1000.0], [0.0, -1000.0], [0.0, -1000.0]])
+    fracs = np.full(3, 1.0 / 3.0)
+    actual_bits = np.array([3.0, 3.03])
+    got = budget_dp(values, fracs, actual_bits, 3.01, resolution=10000)
+    assert got.tolist() == [0, 0, 0]
 
 
 def test_budget_dp_never_exceeds_the_budget():
