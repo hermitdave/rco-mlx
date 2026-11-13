@@ -200,3 +200,21 @@ def test_optimizer_warm_start_from_values():
     )
     opt.init_from_values(values)
     assert abs(opt.expected_bits() - 4.0) < 1e-3
+
+
+def test_budget_dp_infeasible_message_respects_masked_options():
+    """The infeasibility diagnostic must use the masked (allowed) options.
+
+    With an expert bit floor, the raw cheapest option set can sit far below the
+    budget while the true cheapest is above it -- reporting the raw minimum
+    reads as a contradiction ("cheapest 2.25 bpw" vs a 4.1 budget).
+    """
+    # 2 groups, 3 options. Group 0 is floor-masked below option index 2.
+    values = np.array([[-np.inf, -np.inf, -1.0], [-1.0, -1.0, -1.0]])
+    fracs = np.array([0.5, 0.5])
+    actual_bits = np.array([2.0, 3.0, 4.0])
+    # group 0 can only take 4-bit (2.0 bpw); group 1 can take 2/3/4.
+    # cheapest respecting the mask = 0.5*4 + 0.5*2 = 3.0 bpw = 30000 units,
+    # so a 2.5 bpw budget is infeasible and the message must say 30000.
+    with pytest.raises(ValueError, match="respecting forbidden options costs 30000"):
+        budget_dp(values, fracs, actual_bits, 2.5, resolution=10000)

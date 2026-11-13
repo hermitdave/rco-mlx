@@ -126,10 +126,22 @@ def budget_dp(
 
     finite = np.isfinite(dp)
     if not finite.any():
+        # Report the cheapest option set that respects forbidden (-inf)
+        # options, not the raw minimum -- with an expert bit floor the raw
+        # minimum can sit far below the budget while the true minimum is
+        # above it, which reads as a contradiction.
+        per_group_min = np.where(np.isfinite(values), costs, np.inf).min(axis=1)
+        if not np.isfinite(per_group_min).all():
+            raise ValueError(
+                f"No feasible assignment at target_avg_bits={target_avg_bits}: "
+                f"{int((~np.isfinite(per_group_min)).sum())} groups have no "
+                f"allowed option (all masked)."
+            )
         raise ValueError(
             f"No feasible assignment at target_avg_bits={target_avg_bits} "
             f"(budget={budget} units at resolution={resolution}). The cheapest "
-            f"option set costs {int(costs.min(axis=1).sum())} units."
+            f"option set respecting forbidden options costs "
+            f"{int(per_group_min.sum())} units."
         )
 
     # Prefer the full budget; fall back to the nearest reachable value below it.
