@@ -539,13 +539,22 @@ def per_group_clip_search(
     mode: str,
     clip_grid=PER_GROUP_CLIP_GRID,
     max_batch_bytes: int = 256 * 1024 * 1024,
+    hessian: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Choose one clip ratio per (row, group) minimising weighted MSE.
+    """Choose one clip ratio per (row, group) minimising the output error.
 
     ``col_w`` is the imatrix per-input-column importance (mean-1). The
     objective is ``sum_j col_w[j] * (w[:,j] - dequant(quant(w[:,j])))^2``,
     i.e. the diagonal-Hessian output error an imatrix encodes. Passing
     ``col_w=None`` falls back to plain MSE.
+
+    ``hessian=(lam, vec)`` is a low-rank factor of the per-expert Hessian
+    (from scripts/capture_hessians.py). When given it REPLACES the diagonal
+    objective with the full one, ``tr(dW H dW^T) ~ ||dW V sqrt(lam)||^2``,
+    which is what the error DB also scores. Keeping the two objectives
+    aligned matters: the DB decides where bits go, the clip search decides
+    how each tensor is rounded, and a mismatch shows up as a worse model
+    even when each half is optimal in isolation.
 
     Returns ``[rows, n_groups]`` clip ratios. Candidates are evaluated in
     memory-bounded batches by stacking them into the leading axis, which
@@ -579,7 +588,23 @@ def per_group_clip_search(
         dq = _quantize_dequant_np(stacked, bits, gs, mode).reshape(
             len(chunk), out, g, gs
         )
-        err = (cw[None, None] * (wg[None] - dq) ** 2).sum(axis=-1)  # [C, out, g]
+        dw = (wg[None] - dq).reshape(len(chunk), out, inn).astype(np.float32)
+        if hessian is None:
+            err = (cw[None, None] * dw.reshape(len(chunk), out, g, gs) ** 2).sum(axis=-1)
+        else:
+            lam, vec = hessian
+            if vec.shape[0] != inn:
+                raise ValueError(
+                    f"per_group_clip_search: hessian width {vec.shape[0]} "
+                    f"!= tensor width {inn}"
+                )
+            VS = vec.astype(np.float32) * np.sqrt(
+                np.maximum(np.asarray(lam, dtype=np.float32), 0.0)
+            )[None, :]
+            err = np.empty((len(chunk), out, g), dtype=np.float32)
+            for gi in range(g):
+                sub = dw[:, :, gi * gs : (gi + 1) * gs] @ VS[gi * gs : (gi + 1) * gs, :]
+                err[:, :, gi] = (sub ** 2).sum(axis=-1)
         chunk_min = err.min(axis=0)
         chunk_arg = err.argmin(axis=0)
         mask = chunk_min < best_err
@@ -621,6 +646,7 @@ def stream_quantize(
     per_group_clip: bool = False,
     clip_grid=PER_GROUP_CLIP_GRID,
     clip_max_bits: int = 8,
+    hessian_dir: Path | None = None,
 ):
     """Stream through BF16 source, quantize per allocation, write shards."""
     import torch
@@ -628,6 +654,15 @@ def stream_quantize(
     from rco_mlx.mlx_alloc import MlxQuantConfig
 
     imatrix = None
+    hessian_factors = {}
+    if hessian_dir is not None:
+        from rco_mlx.hessians import load_hessian_factors
+
+        hessian_factors = load_hessian_factors(hessian_dir)
+        print(
+            f"[quant] full-Hessian clip objective: {len(hessian_factors)} expert tensors "
+            f"from {hessian_dir}"
+        )
     if per_group_clip and imatrix_path is not None:
         from rco_mlx.imatrix import Imatrix
 
@@ -818,8 +853,12 @@ def stream_quantize(
                                 else None
                             )
                             if col_w is not None:
+                                from rco_mlx.hessians import hessian_key_for
+
+                                hk = hessian_key_for(key)
                                 clips = per_group_clip_search(
-                                    w_np, col_w, bits, q_gs, quant_mode, clip_grid
+                                    w_np, col_w, bits, q_gs, quant_mode, clip_grid,
+                                    hessian=hessian_factors.get(hk) if hk else None,
                                 )
                                 w_np = _apply_clips(w_np, clips, q_gs)
                                 n_pg_search += 1
@@ -1139,9 +1178,10 @@ def main():
                          "source fits in memory (70 percent RAM gate)")
     ap.add_argument("--hessian-dir", default=None,
                     help="Directory of per-expert Hessian factors from "
-                         "scripts/capture_hessians.py; expert tensors in the error "
-                         "DB are then scored by the Hessian-weighted output error "
-                         "tr(dW H dW^T) instead of plain weight MSE")
+                         "scripts/capture_hessians.py. Used BOTH to score expert "
+                         "tensors in the error DB (tr(dW H dW^T) instead of weight "
+                         "MSE) and as the clip search's objective, so the two "
+                         "optimize the same quantity")
     ap.add_argument("--clip-search", action="store_true",
                     help="Sweep per-tensor scale multipliers in the error DB "
                          "and apply the recorded clip at quantize time")
@@ -1537,6 +1577,7 @@ def main():
         group_size_map=group_size_map or None, clip_map=clip_map or None,
         imatrix_path=imatrix_path, per_group_clip=args.per_group_clip,
         clip_grid=clip_grid, clip_max_bits=args.clip_max_bits,
+        hessian_dir=args.hessian_dir,
     )
 
     # Post-process: apply Qwen3.5 sanitize for quantized weights

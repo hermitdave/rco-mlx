@@ -26,6 +26,9 @@ import argparse, json, re, sys
 from pathlib import Path
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from rco_mlx.hessians import hessian_key_for, load_hessian_factors  # noqa: E402
+
 SKIP_SUBSTRINGS = (
     "ngram_embedding",   # 51B PLE table -- uniform 3-bit, not RCO
     "embed_tokens",      # BF16 preserved
@@ -36,39 +39,6 @@ SKIP_PREFIXES = ("mtp.",)  # MTP head -- BF16 preserved
 EXPERT_RE = re.compile(
     r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.mlp\.experts)\.\d+\.([a-z_]+)\.weight$"
 )
-
-# HF expert key -> (layer, projection, expert index), used to look up the
-# per-expert Hessian factors written by scripts/capture_hessians.py.
-_HESS_KEY_RE = re.compile(
-    r"^((?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp)\.experts\.(\d+)\.([a-z_]+)\.weight$"
-)
-
-
-def hessian_key_for(hf_key: str):
-    m = _HESS_KEY_RE.match(hf_key)
-    if not m:
-        return None
-    return (int(m.group(2)), m.group(4), int(m.group(3)))
-
-
-def load_hessian_factors(hessian_dir) -> dict:
-    """Load ``(layer, proj, expert) -> (lam, vec)`` from capture_hessians.py."""
-    factors = {}
-    for f in sorted(Path(hessian_dir).glob("layer-*.npz")):
-        z = np.load(f)
-        for k in z.files:
-            if not k.startswith("vec_"):
-                continue
-            stem, _, e = k[len("vec_"):].rpartition("_")
-            parts = stem.split(".")
-            # stem is "layers.N.mlp.switch_mlp.PROJ" (or the older
-            # "N.mlp.switch_mlp.PROJ" from early captures)
-            layer = int(parts[1] if parts[0] == "layers" else parts[0])
-            proj = parts[-1]
-            lam = np.asarray(z[f"lam_{stem}_{e}"], dtype=np.float32)
-            vec = np.asarray(z[k], dtype=np.float32)
-            factors[(layer, proj, int(e))] = (lam, vec)
-    return factors
 
 
 def hessian_errors(w, bitwidths, group_size, lam, vec) -> dict:
