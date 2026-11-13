@@ -121,6 +121,7 @@ def build_error_db(
     use_gptq: bool = True,
     imatrix_path: Path | None = None,
     clip_search: bool = False,
+    hessian_dir: Path | None = None,
 ) -> Path:
     """Build GPTQ-based error_db using the streaming two-phase approach."""
     script = Path(__file__).parent.parent / "scripts" / "build_error_db_perblock.py"
@@ -143,6 +144,8 @@ def build_error_db(
         cmd += ["--imatrix", str(imatrix_path)]
     if clip_search:
         cmd.append("--clip-search")
+    if hessian_dir:
+        cmd += ["--hessian-dir", str(hessian_dir)]
 
     print(f"[2/5] building error_db: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -1134,6 +1137,11 @@ def main():
     ap.add_argument("--build-imatrix", action="store_true",
                     help="Capture a local imatrix via forward pass when the BF16 "
                          "source fits in memory (70 percent RAM gate)")
+    ap.add_argument("--hessian-dir", default=None,
+                    help="Directory of per-expert Hessian factors from "
+                         "scripts/capture_hessians.py; expert tensors in the error "
+                         "DB are then scored by the Hessian-weighted output error "
+                         "tr(dW H dW^T) instead of plain weight MSE")
     ap.add_argument("--clip-search", action="store_true",
                     help="Sweep per-tensor scale multipliers in the error DB "
                          "and apply the recorded clip at quantize time")
@@ -1342,6 +1350,7 @@ def main():
                 use_gptq=not args.no_gptq,
                 imatrix_path=imatrix_path,
                 clip_search=args.clip_search,
+                hessian_dir=args.hessian_dir,
             )
 
         # Load error_db for allocation (name-aligned to groups)

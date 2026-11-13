@@ -37,6 +37,66 @@ EXPERT_RE = re.compile(
     r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.mlp\.experts)\.\d+\.([a-z_]+)\.weight$"
 )
 
+# HF expert key -> (layer, projection, expert index), used to look up the
+# per-expert Hessian factors written by scripts/capture_hessians.py.
+_HESS_KEY_RE = re.compile(
+    r"^((?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp)\.experts\.(\d+)\.([a-z_]+)\.weight$"
+)
+
+
+def hessian_key_for(hf_key: str):
+    m = _HESS_KEY_RE.match(hf_key)
+    if not m:
+        return None
+    return (int(m.group(2)), m.group(4), int(m.group(3)))
+
+
+def load_hessian_factors(hessian_dir) -> dict:
+    """Load ``(layer, proj, expert) -> (lam, vec)`` from capture_hessians.py."""
+    factors = {}
+    for f in sorted(Path(hessian_dir).glob("layer-*.npz")):
+        z = np.load(f)
+        for k in z.files:
+            if not k.startswith("vec_"):
+                continue
+            stem, _, e = k[len("vec_"):].rpartition("_")
+            parts = stem.split(".")
+            layer = int(parts[1])
+            proj = parts[-1]
+            lam = np.asarray(z[f"lam_{stem}_{e}"], dtype=np.float32)
+            vec = np.asarray(z[k], dtype=np.float32)
+            factors[(layer, proj, int(e))] = (lam, vec)
+    return factors
+
+
+def hessian_errors(w, bitwidths, group_size, lam, vec) -> dict:
+    """Per-bitwidth Hessian-weighted reconstruction error.
+
+    The output error implied by the quantized weight is
+    ``tr(dW H dW^T)``; with the captured low-rank factor ``H ~ V diag(lam) V^T``
+    this is ``||dW V sqrt(lam)||_F^2``, normalized per element so it stays
+    comparable to the plain MSE the DB already reports.
+
+    Unlike GPTQ this never inverts H, so it is well-defined even when the
+    per-expert Hessian is rank-deficient (which it is for MoE: n < d).
+    """
+    rows, cols = w.shape
+    if cols != vec.shape[0]:
+        raise ValueError(f"hessian width {vec.shape[0]} != tensor width {cols}")
+    Vs = vec.astype(np.float32) * np.sqrt(np.maximum(lam, 0.0)).astype(np.float32)[None, :]
+    out = {}
+    for bw in bitwidths:
+        qmax = float((1 << (bw - 1)) - 1)
+        grouped = w.reshape(rows, -1, group_size)
+        max_abs = np.abs(grouped).max(axis=-1, keepdims=True)
+        s = max_abs / qmax
+        s = np.where(s == 0, 1.0, s)
+        w_q = np.clip(np.round(grouped / s), -qmax, qmax) * s
+        dw = (grouped - w_q).reshape(rows, cols).astype(np.float32)
+        proj = dw @ Vs  # [rows, r]
+        out[str(bw)] = {"error": float((proj ** 2).sum() / (rows * cols)), "clip": 1.0}
+    return out
+
 
 def is_skipped(key: str) -> bool:
     if key.startswith(SKIP_PREFIXES):
@@ -145,6 +205,11 @@ def main():
     ap.add_argument("--clip-search", action="store_true",
                     help="Sweep per-column scale multipliers and keep the "
                          "MSE-optimal clip per tensor/bitwidth")
+    ap.add_argument("--hessian-dir", default=None,
+                    help="Directory of per-expert Hessian factors from "
+                         "scripts/capture_hessians.py. When given, expert "
+                         "tensors are scored by the Hessian-weighted output "
+                         "error tr(dW H dW^T) instead of plain weight MSE")
     # Legacy passthrough args (ignored; kept for caller compatibility).
     ap.add_argument("--model-type", default=None)
     ap.add_argument("--calibration", default=None)
@@ -183,6 +248,12 @@ def main():
     if args.clip_search:
         print("Clip search: enabled (scales 1.0/0.9/0.8/0.7/0.6 per tensor)", flush=True)
 
+    hessian_factors = {}
+    if args.hessian_dir:
+        hessian_factors = load_hessian_factors(args.hessian_dir)
+        print(f"Hessian factors: {len(hessian_factors)} expert tensors "
+              f"from {args.hessian_dir}", flush=True)
+
     # Resume state.
     done_keys = set()
     agg = {}   # row_key -> {err_sum: {bw: weighted}, params, members}
@@ -219,9 +290,14 @@ def main():
                     mapped = imatrix.col_weights_for_hf_key(key)
                     if mapped is not None:
                         col_w, route_w = mapped
-                errs = rtn_errors(w, bitwidths, col_weights=col_w,
-                                  clip_search=args.clip_search,
-                                  group_size=args.group_size)
+                hk = hessian_key_for(key)
+                if hessian_factors and hk in hessian_factors:
+                    lam, vec = hessian_factors[hk]
+                    errs = hessian_errors(w, bitwidths, args.group_size, lam, vec)
+                else:
+                    errs = rtn_errors(w, bitwidths, col_weights=col_w,
+                                      clip_search=args.clip_search,
+                                      group_size=args.group_size)
                 del w
                 row = expert_row_key(key)
                 if row is not None:
