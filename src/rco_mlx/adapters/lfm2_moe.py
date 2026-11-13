@@ -50,7 +50,11 @@ class Lfm2MoeAdapter(ModelAdapter):
         "k_layernorm",
         "feed_forward.gate",
         "expert_bias",
-        "conv.conv",
+        # NOTE: do NOT list `conv.conv` here. `_filter_bf16_prefixes` falls back
+        # to matching the prefix's last dotted component, so `conv.conv` becomes
+        # `.conv.` and drops `conv.in_proj`/`conv.out_proj` (301M params) from
+        # the emitted config. The depthwise conv is excluded in `should_quantize`
+        # via the explicit `".conv.conv." in mlx_key` check instead.
     )
 
     # HF SwiGLU name -> mlx_lm sanitize name

@@ -9,6 +9,38 @@ import pytest
 from rco_mlx.adapters import OLMoEAdapter, Qwen3NextMoEAdapter, get, register
 
 
+def test_lfm2_conv_prefix_does_not_overmatch_conv_projections():
+    """`conv.conv` must not be a BF16 prefix.
+
+    `_filter_bf16_prefixes` falls back to matching the prefix's last dotted
+    component, so a `conv.conv` prefix becomes `.conv.` and silently drops
+    `conv.in_proj`/`conv.out_proj` (301M params on LFM2.5-8B-A1B) from the
+    emitted config while they are in fact quantized on disk.
+    """
+    import importlib.util
+    from pathlib import Path as _P
+
+    from rco_mlx.adapters.lfm2_moe import Lfm2MoeAdapter
+
+    prefixes = Lfm2MoeAdapter().non_quantized_prefixes()
+    assert "conv.conv" not in prefixes
+
+    p = _P(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
+    spec = importlib.util.spec_from_file_location("moe_pipeline", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    assignment = {
+        "model.layers.0.conv.conv": 4,
+        "model.layers.0.conv.in_proj": 4,
+        "model.layers.0.conv.out_proj": 4,
+        "model.layers.0.mlp.gate": 4,
+    }
+    filtered = m._filter_bf16_prefixes(assignment, prefixes)
+    assert "model.layers.0.conv.in_proj" in filtered
+    assert "model.layers.0.conv.out_proj" in filtered
+
+
 def _write_fake_olmoe(root: Path):
     """Write a minimal OLMoE config + one shard."""
     root.mkdir(parents=True, exist_ok=True)
