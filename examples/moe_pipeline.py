@@ -382,6 +382,20 @@ def resolve_imatrix(args, source: Path, output: Path) -> Path | None:
                 "capture (70% RAM gate). Use a published imatrix via "
                 "--imatrix-repo, or run on a larger machine."
             )
+        calib = None
+        if args.calibration:
+            calib = Path(args.calibration).expanduser().resolve()
+        elif args.calibration_dataset:
+            # the pipeline saves dataset calibrations under <source>/work
+            cands = sorted((source / "work").glob("calib_*.npy"))
+            if cands:
+                calib = cands[-1]
+        if calib is None or not calib.exists():
+            sys.exit(
+                "imatrix build needs a calibration: pass --calibration or "
+                "--calibration-dataset (the pipeline saves the latter under "
+                "<source>/work/calib_*.npy)"
+            )
         capture = (
             Path(__file__).parent.parent / "scripts" / "capture_imatrix.py"
         )
@@ -389,7 +403,7 @@ def resolve_imatrix(args, source: Path, output: Path) -> Path | None:
         cmd = [
             sys.executable, str(capture),
             "--source", str(source),
-            "--calibration", str(work / "calib.npy"),
+            "--calibration", str(calib),
             "--output", str(imatrix_path),
         ]
         print(f"Building local imatrix: {' '.join(cmd)}")
