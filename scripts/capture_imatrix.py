@@ -38,9 +38,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
 def _mlx_to_hf_expert_key(mlx_path: str, expert: int) -> str:
-    """model.layers.N.mlp.switch_mlp.gate_proj -> ...experts.E.gate_proj.weight"""
+    """...layers.N.mlp.switch_mlp.gate_proj -> ...experts.E.gate_proj.weight"""
     m = re.match(
-        r"^(.*layers\.\d+\.mlp)\.switch_mlp\.(gate_proj|up_proj|down_proj)$",
+        r"^(.*layers\.\d+\.(?:mlp|feed_forward))\.switch_mlp\.(gate_proj|up_proj|down_proj)$",
         mlx_path,
     )
     if m:
