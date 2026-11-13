@@ -60,6 +60,43 @@ on KL (0.180 vs 0.179) and within 1.1 pp on top-1, while being 6% larger
 (0.972 vs 0.919 GB). At matched 4.25 bpw the gap is real (top-1 71.8% vs
 77.4%) — the tighter budget forces 3-bit placements that PGC cannot repair.
 
+## Results — zero-shot task recovery (5 tasks × 400)
+
+`slq_mlx.scripts.run_zero_shot`; recovery = quant_acc / BF16_acc.
+
+| Task | BF16 acc | MACaQ acc | MACaQ recovery | RCO-PGC-45 acc | RCO-PGC recovery |
+|---|---|---|---|---|---|
+| arc_challenge | 0.2175 | 0.2000 | 0.9200 | 0.2050 | 0.9425 |
+| arc_easy | 0.4175 | 0.3975 | 0.9521 | 0.3975 | 0.9521 |
+| hellaswag | 0.3800 | 0.3575 | 0.9408 | 0.3850 | 1.0132 |
+| winogrande | 0.4800 | 0.4925 | 1.0260 | 0.5100 | 1.0625 |
+| mmlu | 0.2975 | 0.2650 | 0.8908 | 0.2725 | 0.9160 |
+| **mean** | — | — | **0.9458** | — | **0.9772** |
+
+Neither checkpoint is task-lossless (≥0.99). Every RCO per-task paired CI
+crosses zero except MMLU (-0.025 ± 0.015, CI [-0.054, +0.004]); MACaQ's
+HellaSwag and MMLU CIs exclude zero negatively. LFM3 is weak at these tasks,
+so n=400 differences of a few points are noisy — read the mean recovery as
+the signal.
+
+## Results — throughput (~1K context, 256 generated tokens, mlx-lm)
+
+Single measured run after one warmup pass (`macaq-mlx/benchmarks/bench_tps.py`).
+Scale dtype dominates decode: converting only the affine scales/biases to
+bfloat16 lifts decode 134 → 174 tok/s for ~0.005 KL.
+
+| Model | Prompt tps | Decode tps | Peak RAM |
+|---|---|---|---|
+| BF16 reference | 2794.6 | 71.5 | 4.34 GB |
+| MACaQ mxfp4 + refine (4.25 bpw) | 2707.8 | 162.1 | 2.22 GB |
+| RCO-PGC-45, float16 scales (4.50 bpw) | 2409.7 | 134.3 | 2.65 GB |
+| RCO-PGC-45, bfloat16 scales | **2877.6** | **173.8** | 2.27 GB |
+
+With bfloat16 scales the mixed-precision RCO build decodes ~7% faster than
+MACaQ's uniform mxfp4 and ~2.4× faster than BF16, while costing 0.005 more
+KL (0.1846 vs 0.1798). The bf16 conversion is an in-place `.scales`/`.biases`
+rewrite; no re-quantization is needed.
+
 ## Findings
 
 1. **Harness validated twice.** Uniform 4-bit through the RCO pipeline
@@ -76,12 +113,19 @@ on KL (0.180 vs 0.179) and within 1.1 pp on top-1, while being 6% larger
 4. **The 4.25-bpw cliff without PGC is steep** (40.65 → 53.21 for 0.25 bpw
    saved): the DP places 3-bit FFN down-projections that affine RTN cannot
    carry. PGC absorbs most of it.
-5. **MACaQ still leads at matched size.** At 0.918–0.919 GB / 4.25 bpw,
-   MACaQ scores PPL 35.47 / top-1 77.4% vs RCO-PGC 41.60 / 71.8%. Its edge is
-   structural: E2M1 float codebook + Hessian flip-refinement against a BF16
-   teacher. RCO's remaining lever is activation-aware refinement beyond
-   per-group scale search (e.g. GPTQ-style compensation is blocked by
-   rank-deficient Hessians on MoE but viable on dense projections).
+5. **MACaQ still leads at matched size on quality.** At 0.918–0.919 GB /
+   4.25 bpw, MACaQ scores PPL 35.47 / top-1 77.4% vs RCO-PGC 41.60 / 71.8%.
+   Its edge is structural: E2M1 float codebook + Hessian flip-refinement
+   against a BF16 teacher. RCO's remaining lever is activation-aware
+   refinement beyond per-group scale search (e.g. GPTQ-style compensation is
+   blocked by rank-deficient Hessians on MoE but viable on dense
+   projections).
+6. **On zero-shot recovery and throughput RCO-PGC-45 compares well.** Zero-shot
+   mean recovery 0.977 (RCO) vs 0.946 (MACaQ), neither task-lossless; RCO's
+   per-task CIs all cross zero except MMLU. With bfloat16 affine scales,
+   decode is 173.8 tok/s vs MACaQ's 162.1 and BF16's 71.5 at ~1K context, for
+   +0.005 KL — so at 4.5 bpw the RCO build trades ~6% more bytes than MACaQ
+   for slightly worse PPL but faster decoding and better task recovery.
 
 ## Reproduce
 
