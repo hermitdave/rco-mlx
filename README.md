@@ -33,7 +33,7 @@ property for both speed and quality.
 || `mlx_alloc.py` | — | New. Emits the MLX config block. |
 || `validate.py` | — | New. Structural checks before a load. |
 || `scripts/build_moe_error_db.py` | — | Self-contained streaming error_db builder with GPTQ + batched experts. |
-| `examples/moe_pipeline.py` | — | End-to-end MoE pipeline: introspect → error_db → RCO → quantize. |
+| `examples/moe_pipeline.py` | — | End-to-end pipeline (dense + MoE): introspect → error_db → RCO → quantize. |
 
 **The one design change that matters.** The original drives the optimizer from
 a live PyTorch model: it registers a parametrization on every layer's weight,
@@ -248,7 +248,7 @@ the target.
 python -m pytest
 ```
 
-88 tests, pure NumPy + MLX, no GPU required. The manifold primitives are checked
+110 tests, pure NumPy + MLX, no GPU required. The manifold primitives are checked
 against a finite difference of the budget function and the DP against a
 brute-force enumeration, so the port is verified against first principles
 rather than against the PyTorch original.
@@ -283,7 +283,8 @@ We validated the pipeline on [allenai/OLMoE-1B-7B-0125](https://huggingface.co/a
 **What changed for v0.2:**
 - New `build_moe_error_db.py` uses **GPTQ-based (Hessian-scaled) error measurement** instead of plain RTN
 - MoE experts are **batched** using the shared per-layer Hessian for 10-15x speedup
-- Pipeline is now **MoE-only, streaming-only** — no dense-model code paths
+- Pipeline is streaming-only and handles **both dense and MoE** checkpoints
+  (dense models use the generic `default` adapter; omit `--model-type`)
 - Symmetric mode (`--quant-mode symmetric`) reduces scale overhead by 50%
 
 **Validation results (4-bit mixed precision, target 4.0 bpw):**

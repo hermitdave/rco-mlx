@@ -1142,9 +1142,36 @@ def build_calibration_from_dataset(
     seq_length: int = 2048,
     add_bos: bool = False,
 ) -> Path:
-    from transformers import AutoTokenizer
+    # Some custom architectures (e.g. LFM3's hybrid rope config) crash
+    # transformers' auto-config import before a tokenizer is usable. Fall back
+    # to tokenizer.json, which needs no config at all.
+    bos = None
+    try:
+        from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(str(source_dir), trust_remote_code=True, local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(source_dir), trust_remote_code=True, local_files_only=True
+        )
+        bos = getattr(tokenizer, "bos_token_id", None)
+
+        def encode(text):
+            return list(tokenizer.encode(text))
+    except Exception as exc:
+        print(f"[calib] AutoTokenizer unavailable ({type(exc).__name__}); "
+              f"using tokenizer.json directly")
+        from tokenizers import Tokenizer
+
+        tk = Tokenizer.from_file(str(source_dir / "tokenizer.json"))
+
+        def encode(text):
+            return tk.encode(text).ids
+
+        try:
+            with open(source_dir / "config.json") as f:
+                bos = json.load(f).get("bos_token_id")
+        except Exception:
+            pass
+
     print(f"[calib] loading dataset: {dataset} ({num_samples} samples x {seq_length} tokens)")
 
     if dataset == "wikitext":
@@ -1172,7 +1199,7 @@ def build_calibration_from_dataset(
     else:
         sys.exit(f"Unknown calibration dataset: {dataset}. Choose: wikitext, fineweb, c4")
 
-    all_ids = tokenizer.encode(text)
+    all_ids = encode(text)
     target = num_samples * seq_length
     if len(all_ids) < target:
         all_ids = (all_ids * ((target + len(all_ids) - 1) // len(all_ids)))[:target]
@@ -1181,7 +1208,6 @@ def build_calibration_from_dataset(
 
     # Some tokenizers (LFM2.5) define a bos_token_id but do not add it in
     # encode(), and the model is lost without it (wikitext PPL 210 vs ~12).
-    bos = getattr(tokenizer, "bos_token_id", None)
     if add_bos and bos is not None:
         per = seq_length - 1
         rows = [all_ids[i * per:(i + 1) * per] for i in range(num_samples)]
