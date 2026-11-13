@@ -36,6 +36,11 @@ def get(name: str) -> type:
     return _REGISTRY[name]
 
 
+def registered_names() -> list[str]:
+    """Names of every registered adapter."""
+    return sorted(_REGISTRY)
+
+
 class ModelAdapter(ABC):
     """Base class for model adapters."""
 

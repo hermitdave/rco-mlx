@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """
-RCO mixed-precision quantization pipeline for MoE models on MLX.
+RCO mixed-precision quantization pipeline for MLX.
 
-MoE-only, streaming-only, GPTQ-based error measurement.
+Works on both dense transformers (Llama/Qwen/LFM3-style, via the generic
+``default`` adapter) and MoE models (olmoe, qwen3_5_moe, qwen4_exp,
+lfm2_moe, granitemoehybrid). Streaming-only, per-tensor RTN error DB.
 
-Usage:
+Usage (dense):
+    python examples/moe_pipeline.py \\
+        --source /path/to/bf16-dense \\
+        --output /path/to/output \\
+        --target-bpw 4.0 \\
+        --group-size 64 \\
+        --calibration-dataset wikitext
+
+Usage (MoE):
     python examples/moe_pipeline.py \\
         --source /path/to/bf16-moe \\
         --output /path/to/output \\
         --target-bpw 3.5 \\
         --group-size 64 \\
         --model-type olmoe \\
-        --calibration-dataset wikitext \\
-        --quant-mode symmetric
+        --calibration-dataset wikitext
 """
 
 from __future__ import annotations
@@ -993,6 +1002,9 @@ def stream_quantize(
         if f.is_file() and not dest.exists():
             shutil.copy2(f, dest)
 
+    # Write the shard index last: it must reflect the final set of shards.
+    write_output_index(output_dir)
+
     print(f"\n[quant] done — {total_tensors} tensors, {time.time()-start:.1f}s total")
     if per_group_clip and imatrix is not None:
         print(
@@ -1004,6 +1016,30 @@ def stream_quantize(
         print(f"[quant] per-group clip histogram ({total} groups):")
         for v in sorted(clip_hist, reverse=True):
             print(f"  {v:.2f}: {clip_hist[v]} ({100*clip_hist[v]/total:.1f}%)")
+
+
+def write_output_index(output_dir: Path) -> None:
+    """Write ``model.safetensors.index.json`` for every shard in the output.
+
+    oMLX discovers shards from filename numbering when no index is present
+    and skips layouts whose prefixes do not line up; an explicit index makes
+    discovery independent of file naming (``model-*``, ``ngram-*``).
+    """
+    shards = sorted(output_dir.glob("*.safetensors"))
+    if not shards:
+        return
+    weight_map = {}
+    total_size = 0
+    for sp in shards:
+        with safe_open(str(sp), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                weight_map[key] = sp.name
+        total_size += sp.stat().st_size
+    index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
+    tmp = output_dir / "model.safetensors.index.json.tmp"
+    tmp.write_text(json.dumps(index, indent=2))
+    tmp.replace(output_dir / "model.safetensors.index.json")
+    print(f"[quant] wrote index ({len(weight_map)} tensors across {len(shards)} shards)")
 
 
 def _rewrite_config_mlx_keys(output_dir: Path, model_adapter, quant_mode: str = "affine"):
@@ -1166,14 +1202,19 @@ def build_calibration_from_dataset(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="RCO MoE-only mixed-precision quantization pipeline (streaming, GPTQ-based)",
+        description="RCO mixed-precision quantization pipeline (dense + MoE, "
+                    "streaming, per-tensor RTN error DB)",
     )
     ap.add_argument("--source", required=True, help="BF16 source model dir")
     ap.add_argument("--output", required=True, help="Output quantized model dir")
     ap.add_argument("--target-bpw", type=float, required=True, help="Target bits per weight")
     ap.add_argument("--group-size", type=int, default=64)
     ap.add_argument("--default-bits", type=int, default=4)
-    ap.add_argument("--model-type", default=None, help="Model adapter (olmoe, qwen3_5_moe)")
+    ap.add_argument("--model-type", default=None,
+                    help="Model adapter: olmoe, qwen3_5_moe, qwen4_exp, "
+                         "lfm2_moe, granitemoehybrid, or 'default' for a dense "
+                         "transformer. Omit on a dense model to auto-select "
+                         "'default'.")
     ap.add_argument("--calibration", default=None, help="Path to calibration .npy")
     ap.add_argument("--calibration-dataset", default=None, help="Auto-generate calib: wikitext|fineweb|c4")
     ap.add_argument("--calibration-bos", action="store_true",
@@ -1260,15 +1301,31 @@ def main():
     model_adapter = None
     if args.model_type:
         from rco_mlx.adapters import get
-        adapter_cls = get(args.model_type)
-        if adapter_cls is None:
-            sys.exit(f"Unknown model type: {args.model_type}")
-        model_adapter = adapter_cls()
-        print(f"Using model adapter: {args.model_type}")
+        try:
+            adapter_cls = get(args.model_type)
+        except KeyError:
+            adapter_cls = None
+        if adapter_cls is not None:
+            model_adapter = adapter_cls()
+            print(f"Using model adapter: {args.model_type}")
+        else:
+            print(f"WARNING: no adapter registered for --model-type {args.model_type!r}")
 
-    # Validate MoE
-    if not detect_moe_model(source, args.model_type):
-        sys.exit("RCO pipeline is MoE-only. Use a model with num_experts > 1 or pass --model-type.")
+    # Detect MoE (routed experts). Dense models fall back to the generic
+    # default adapter, which quantizes every nn.Linear except norms,
+    # embeddings and lm_head.
+    is_moe = detect_moe_model(source, args.model_type)
+    if model_adapter is None:
+        if is_moe:
+            from rco_mlx.adapters.base import registered_names
+            sys.exit(
+                "MoE model detected but no adapter is registered for it. "
+                f"Registered adapters: {registered_names()} "
+                "(pass --model-type)."
+            )
+        from rco_mlx.adapters import get as _get
+        model_adapter = _get("default")()
+        print("Dense model detected — using the generic default adapter.")
 
     # --- Step 1: introspect ---
     print("[1/5] introspecting model …")
@@ -1497,14 +1554,17 @@ def main():
         print(f"  achieved {report['achieved_bpw']:.4f} bpw")
         print(f"  histogram: {report['bit_histogram']}")
 
-        # Expert allocation. The sanitize constraint is uniformity *within*
-        # each stacked (layer, projection) tensor, not across the model.
-        # 'uniform' (legacy) forces one bitwidth for every routed expert;
-        # 'per-projection' keeps the DP's per-group assignment and only
-        # enforces that within-group invariant; 'gguf-recipe' overrides the
-        # experts with the measured UD-IQ2_XS recipe (qwen4_exp only).
+        # Expert allocation (MoE only). The sanitize constraint is uniformity
+        # *within* each stacked (layer, projection) tensor, not across the
+        # model. 'uniform' (legacy) forces one bitwidth for every routed
+        # expert; 'per-projection' keeps the DP's per-group assignment and
+        # only enforces that within-group invariant; 'gguf-recipe' overrides
+        # the experts with the measured UD-IQ2_XS recipe (qwen4_exp only).
+        # Dense models have no routed experts, so the DP assignment stands.
         all_names = [g.layer_names[0] for g in groups]
-        if args.expert_allocation == "uniform":
+        if not is_moe:
+            pass
+        elif args.expert_allocation == "uniform":
             expert_bits = uniform_expert_bits(args.target_bpw)
             print(f"  expert bitwidth: {expert_bits} (target {args.target_bpw} bpw)")
             # Add all expert groups to assignment with uniform bitwidth.
