@@ -156,7 +156,7 @@ def main() -> None:
 
         payload = {}
         for path, h_dict in state["hess"].items():
-            short = path.split(".", 2)[-1]  # layers.N.mlp.switch_mlp.PROJ
+            short = path.split(".", 1)[-1]  # layers.N.mlp.switch_mlp.PROJ
             for e, h in h_dict.items():
                 n = max(state["counts"][path][e], 1)
                 lam, vecs = randomized_eigen(

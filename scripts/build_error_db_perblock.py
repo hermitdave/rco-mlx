@@ -61,7 +61,9 @@ def load_hessian_factors(hessian_dir) -> dict:
                 continue
             stem, _, e = k[len("vec_"):].rpartition("_")
             parts = stem.split(".")
-            layer = int(parts[1])
+            # stem is "layers.N.mlp.switch_mlp.PROJ" (or the older
+            # "N.mlp.switch_mlp.PROJ" from early captures)
+            layer = int(parts[1] if parts[0] == "layers" else parts[0])
             proj = parts[-1]
             lam = np.asarray(z[f"lam_{stem}_{e}"], dtype=np.float32)
             vec = np.asarray(z[k], dtype=np.float32)
