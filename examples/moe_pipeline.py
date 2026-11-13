@@ -698,14 +698,19 @@ def stream_quantize(
             if clip:
                 layer_clip[clean] = float(clip)
         if model_adapter is not None:
-            mlx = model_adapter.map_key_to_mlx(path)
+            # Match _rewrite_config_mlx_keys: the adapter's rename only fires
+            # when ".weight" is present (LFM2 w1 -> gate_proj), so a bare
+            # module path would leave layer_bits keyed differently from the
+            # emitted config and the quantizer would fall back to default bits.
+            mlx = model_adapter.map_key_to_mlx(path + ".weight")
             if mlx:
-                layer_bits[mlx.removesuffix(".weight")] = bits
+                mlx = mlx.removesuffix(".weight")
                 layer_bits[mlx] = bits
-                if mlx.removesuffix(".weight") in layer_gs:
-                    layer_gs[mlx] = layer_gs[mlx.removesuffix(".weight")]
-                if mlx.removesuffix(".weight") in layer_clip:
-                    layer_clip[mlx] = layer_clip[mlx.removesuffix(".weight")]
+                layer_bits[mlx + ".weight"] = bits
+                if clean in layer_gs:
+                    layer_gs[mlx] = layer_gs[clean]
+                if clean in layer_clip:
+                    layer_clip[mlx] = layer_clip[clean]
 
     def _apply_clip(w_np: np.ndarray, gs: int, clip: float) -> np.ndarray:
         """Clamp per-group magnitudes at clip * group-max before quantizing.
