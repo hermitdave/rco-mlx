@@ -690,6 +690,7 @@ def stream_quantize(
     clip_map: dict[str, float] | None = None,
     imatrix_path: Path | None = None,
     per_group_clip: bool = False,
+    lsq_refit: bool = False,
     clip_grid=PER_GROUP_CLIP_GRID,
     clip_max_bits: int = 8,
     hessian_dir: Path | None = None,
@@ -737,7 +738,7 @@ def stream_quantize(
             f"[quant] full-Hessian clip objective: {len(hessian_factors)} expert tensors "
             f"from {hessian_dir}"
         )
-    if per_group_clip and imatrix_path is not None:
+    if (per_group_clip or lsq_refit) and imatrix_path is not None:
         from rco_mlx.imatrix import Imatrix
 
         imatrix = Imatrix(imatrix_path)
@@ -745,7 +746,7 @@ def stream_quantize(
             f"[quant] per-group clip search: grid {tuple(clip_grid)}, "
             f"imatrix {len(imatrix.tensor_names())} tensors"
         )
-    elif per_group_clip:
+    elif (per_group_clip or lsq_refit):
         print(
             "[quant] WARNING: --per-group-clip without an imatrix; skipping the "
             "search. An unweighted search is measured to be WORSE than the "
@@ -890,6 +891,7 @@ def stream_quantize(
     output_dir.mkdir(parents=True, exist_ok=True)
     total_tensors = 0
     n_pg_search = 0
+    n_lsq = 0
     n_3d_skipped = 0
     clip_hist: dict[float, int] = {}
     start = time.time()
@@ -921,45 +923,58 @@ def stream_quantize(
                         continue
                     if tensor.ndim == 2:
                         w_np = tensor.float().numpy()
-                        if per_group_clip and bits <= clip_max_bits:
-                            # Per-group scale choice, weighted by the imatrix.
-                            # Only run when the tensor actually has imatrix
-                            # column weights: an unweighted search is
-                            # measured to be WORSE than the per-tensor clip
-                            # (OLMoE @2.5 KL 0.559 vs 0.508), so never
-                            # silently fall back to one.
-                            col_w = (
-                                _imatrix_col_weights(imatrix, key, w_np.shape[-1])
-                                if imatrix is not None
-                                else None
-                            )
-                            if col_w is not None:
-                                from rco_mlx.hessians import hessian_key_for
+                        col_w = (
+                            _imatrix_col_weights(imatrix, key, w_np.shape[-1])
+                            if imatrix is not None and (per_group_clip or lsq_refit)
+                            else None
+                        )
+                        base_key = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
+                        if lsq_refit and col_w is not None:
+                            # oQe-style: imatrix-weighted (scale, bias) search
+                            # plus a least-squares refit.  Supersedes the
+                            # weight-clamp search below.
+                            from rco_mlx.weighted_affine import weighted_affine_quantize
 
-                                hk = hessian_key_for(key)
-                                clips = per_group_clip_search(
-                                    w_np, col_w, bits, q_gs, quant_mode, clip_grid,
-                                    hessian=hessian_factors.get(hk) if hk else None,
-                                )
-                                w_np = _apply_clips(w_np, clips, q_gs)
-                                n_pg_search += 1
-                                vals, cnts = np.unique(clips, return_counts=True)
-                                for v, c in zip(vals, cnts):
-                                    clip_hist[float(v)] = clip_hist.get(float(v), 0) + int(c)
+                            q_np, scales_np, biases_np = weighted_affine_quantize(
+                                w_np, col_w, bits, q_gs
+                            )
+                            results[mlx_key] = torch.from_numpy(q_np.astype(np.uint32))
+                            _store_scales(results, base_key, scales_np, biases_np, quant_mode)
+                            n_lsq += 1
+                        else:
+                            if per_group_clip and bits <= clip_max_bits:
+                                # Per-group scale choice, weighted by the imatrix.
+                                # Only run when the tensor actually has imatrix
+                                # column weights: an unweighted search is
+                                # measured to be WORSE than the per-tensor clip
+                                # (OLMoE @2.5 KL 0.559 vs 0.508), so never
+                                # silently fall back to one.
+                                if col_w is not None:
+                                    from rco_mlx.hessians import hessian_key_for
+
+                                    hk = hessian_key_for(key)
+                                    clips = per_group_clip_search(
+                                        w_np, col_w, bits, q_gs, quant_mode, clip_grid,
+                                        hessian=hessian_factors.get(hk) if hk else None,
+                                    )
+                                    w_np = _apply_clips(w_np, clips, q_gs)
+                                    n_pg_search += 1
+                                    vals, cnts = np.unique(clips, return_counts=True)
+                                    for v, c in zip(vals, cnts):
+                                        clip_hist[float(v)] = clip_hist.get(float(v), 0) + int(c)
+                                else:
+                                    w_np = _apply_clip(w_np, q_gs, q_clip)
                             else:
                                 w_np = _apply_clip(w_np, q_gs, q_clip)
-                        else:
-                            w_np = _apply_clip(w_np, q_gs, q_clip)
-                        w = mx.array(w_np)
-                        q, scales, biases = mx.quantize(
-                            w, bits=bits, group_size=q_gs, mode=quant_mode
-                        )
-                        mx.eval(q, scales, biases)
-                        base_key = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
-                        results[mlx_key] = torch.from_numpy(np.array(q).astype(np.uint32))
-                        scales_np = np.array(scales)
-                        biases_np = np.array(biases)
-                        _store_scales(results, base_key, scales_np, biases_np, quant_mode)
+                            w = mx.array(w_np)
+                            q, scales, biases = mx.quantize(
+                                w, bits=bits, group_size=q_gs, mode=quant_mode
+                            )
+                            mx.eval(q, scales, biases)
+                            results[mlx_key] = torch.from_numpy(np.array(q).astype(np.uint32))
+                            scales_np = np.array(scales)
+                            biases_np = np.array(biases)
+                            _store_scales(results, base_key, scales_np, biases_np, quant_mode)
                     elif tensor.ndim == 3:
                         # Stacked MoE expert tensor: quantize ALL experts in batch
                         E, H, I = tensor.shape
@@ -1029,9 +1044,10 @@ def stream_quantize(
     write_output_index(output_dir)
 
     print(f"\n[quant] done — {total_tensors} tensors, {time.time()-start:.1f}s total")
-    if per_group_clip and imatrix is not None:
+    if (per_group_clip or lsq_refit) and imatrix is not None:
         print(
             f"[quant] per-group clip search applied to {n_pg_search} tensors"
+            + (f", lsq-refit on {n_lsq} tensors" if n_lsq else "")
             + (f", skipped {n_3d_skipped} stacked 3D tensors" if n_3d_skipped else "")
         )
     if clip_hist:
@@ -1329,6 +1345,12 @@ def main():
                          "(--imatrix/--imatrix-repo/--build-imatrix); without one "
                          "the search is skipped, because an unweighted search is "
                          "measured to be worse than the per-tensor clip")
+    ap.add_argument("--lsq-refit", action="store_true",
+                    help="oQe-style imatrix-weighted (scale, bias) search plus a "
+                         "least-squares refit, replacing the weight-clamp clip "
+                         "search. Requires an imatrix. This is what oMLX's "
+                         "enhanced=True actually does -- it is NOT GPTQ (the oMLX "
+                         "package contains no Hessian compensation)")
     ap.add_argument("--clip-grid", default=None,
                     help="Comma-separated clip ratios for --per-group-clip "
                          "(default: 1.0 down to 0.6 in 0.05 steps)")
@@ -1744,7 +1766,7 @@ def main():
 
     print("[5/5] streaming quantization …")
     imatrix_path = None
-    if args.per_group_clip and not args.ad_ladder:
+    if (args.per_group_clip or args.lsq_refit) and not args.ad_ladder:
         imatrix_path = resolve_imatrix(args, source, output)
     clip_grid = PER_GROUP_CLIP_GRID
     if args.clip_grid:
@@ -1754,6 +1776,7 @@ def main():
         model_adapter=model_adapter, quant_mode=args.quant_mode,
         group_size_map=group_size_map or None, clip_map=clip_map or None,
         imatrix_path=imatrix_path, per_group_clip=args.per_group_clip,
+        lsq_refit=args.lsq_refit,
         clip_grid=clip_grid, clip_max_bits=args.clip_max_bits,
         hessian_dir=args.hessian_dir, scale_dtype=args.scale_dtype,
     )
