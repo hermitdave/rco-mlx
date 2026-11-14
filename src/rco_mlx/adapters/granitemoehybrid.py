@@ -108,7 +108,10 @@ class GraniteMoeHybridAdapter(ModelAdapter):
         )
 
     def non_quantized_prefixes(self) -> List[str]:
-        return list(self._BF16_PREFIXES)
+        prefixes = list(self._BF16_PREFIXES)
+        if getattr(self, 'quantize_mtp', False):
+            prefixes = [p for p in prefixes if p != 'mtp']
+        return prefixes
 
     def load_calibration(
         self,

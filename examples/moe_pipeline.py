@@ -453,6 +453,7 @@ def emit_and_validate(
     bf16_prefixes: list[str] | None = None,
     group_size_map: dict[str, int] | None = None,
     quantize_embeddings: bool = False,
+    quantize_mtp: bool = False,
 ) -> MlxQuantConfig:
     filtered = assignment
     if bf16_prefixes:
@@ -460,7 +461,9 @@ def emit_and_validate(
 
     quant_assignment = {
         k: v for k, v in filtered.items()
-        if _is_quantizable(k, quantize_embeddings=quantize_embeddings)
+        if _is_quantizable(
+            k, quantize_embeddings=quantize_embeddings, quantize_mtp=quantize_mtp
+        )
     }
     cfg = allocation_to_config(
         quant_assignment,
@@ -495,9 +498,15 @@ def emit_and_validate(
     return cfg
 
 
-def _is_quantizable(path: str, quantize_embeddings: bool = False) -> bool:
+def _is_quantizable(
+    path: str,
+    quantize_embeddings: bool = False,
+    quantize_mtp: bool = False,
+) -> bool:
     check = path if path.endswith(".weight") else path + ".weight"
-    if "norm" in check or "mtp" in check:
+    if "norm" in check:
+        return False
+    if not quantize_mtp and "mtp" in check:
         return False
     if not quantize_embeddings and ("embed" in check or "lm_head" in check):
         return False
@@ -840,6 +849,7 @@ def stream_quantize(
     def should_quantize(mlx_key: str) -> tuple[bool, int, int, float]:
         gs = group_size
         quant_embed = bool(getattr(model_adapter, "quantize_embeddings", False))
+        quant_mtp = bool(getattr(model_adapter, "quantize_mtp", False))
         # N-gram PLE table first: its name contains "embed", which the
         # generic exclusion below would incorrectly match.
         if model_adapter is not None and hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
@@ -847,7 +857,7 @@ def stream_quantize(
         if (
             "norm" in mlx_key
             or (not quant_embed and ("embed" in mlx_key or "lm_head" in mlx_key))
-            or "mtp" in mlx_key
+            or (not quant_mtp and "mtp" in mlx_key)
             or (not mlx_key.endswith(".weight") and ".experts." not in mlx_key)
             or mlx_key.endswith(".bias")
             or ".conv.conv." in mlx_key
@@ -1317,6 +1327,17 @@ def main():
                     help="Minimum bitwidth for embedding groups when "
                          "--quantize-embeddings is set (default 2 = no floor; "
                          "4 is safer for tied output projections).")
+    ap.add_argument("--quantize-mtp", action="store_true",
+                    help="Quantize the MTP (multi-token prediction) head weights "
+                         "at the default bitwidth instead of keeping them BF16. "
+                         "Measure the draft acceptance afterwards: a quantized "
+                         "head can drop below a BF16 graft's acceptance")
+    ap.add_argument("--mtp-bits", type=int, default=None,
+                    help="With --quantize-mtp, force this bitwidth for the MTP "
+                         "head instead of the DP's choice (the DP tends to give "
+                         "the head 8-bit because it is small). The MTP group size "
+                         "is reset to --group-size so a low width is not paired "
+                         "with a coarse gs128")
     ap.add_argument("--imatrix", default=None,
                     help="Path to a GGUF imatrix file or local .npz; weights the "
                          "error DB per input column by activation importance")
@@ -1415,6 +1436,10 @@ def main():
             )
         model_adapter.quantize_embeddings = True
         print("Embedding/lm_head quantization: enabled")
+
+    if args.quantize_mtp:
+        model_adapter.quantize_mtp = True
+        print("MTP head quantization: enabled (default bitwidth)")
 
     quantize_embeddings = bool(getattr(model_adapter, "quantize_embeddings", False))
 
@@ -1649,6 +1674,14 @@ def main():
         print(f"  achieved {report['achieved_bpw']:.4f} bpw")
         print(f"  histogram: {report['bit_histogram']}")
 
+        if args.quantize_mtp and args.mtp_bits:
+            n_over = sum(1 for k in assignment if "mtp" in k)
+            for k in assignment:
+                if "mtp" in k:
+                    assignment[k] = int(args.mtp_bits)
+            if n_over:
+                print(f"  MTP override: {n_over} tensors -> {args.mtp_bits}-bit")
+
         # Expert allocation (MoE only). The sanitize constraint is uniformity
         # *within* each stacked (layer, projection) tensor, not across the
         # model. 'uniform' (legacy) forces one bitwidth for every routed
@@ -1745,6 +1778,11 @@ def main():
         except Exception as exc:
             print(f"  per-tensor group size skipped ({exc}); using gs{args.group_size}")
 
+    if args.quantize_mtp and args.mtp_bits:
+        # A forced low width must not inherit the DP's coarse gs128.
+        for k in [k for k in group_size_map if "mtp" in k]:
+            del group_size_map[k]
+
     clip_map: dict[str, float] = {}
     if not args.ad_ladder and error_db_path.exists():
         clip_map = load_clip_map(error_db_path, assignment)
@@ -1757,6 +1795,7 @@ def main():
         quant_mode=args.quant_mode, bf16_prefixes=bf16_prefixes,
         group_size_map=group_size_map or None,
         quantize_embeddings=quantize_embeddings,
+        quantize_mtp=bool(getattr(model_adapter, "quantize_mtp", False)),
     )
 
     # --- Step 5: quantize ---

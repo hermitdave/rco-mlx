@@ -42,6 +42,11 @@ def registered_names() -> list[str]:
 
 
 class ModelAdapter(ABC):
+    # Quantize the MTP (multi-token prediction) head instead of keeping it
+    # BF16.  Off by default: the head is small, and a grafted BF16 head
+    # drafts measurably better than a quantized one.
+    quantize_mtp = False
+
     """Base class for model adapters."""
 
     # Subclasses set these

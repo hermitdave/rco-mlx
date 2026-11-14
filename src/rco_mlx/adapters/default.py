@@ -91,6 +91,8 @@ class DefaultAdapter(ModelAdapter):
         prefixes: List[str] = list(self._BF16_PREFIXES)
         if self.quantize_embeddings:
             prefixes = [p for p in prefixes if p not in ("embed_tokens", "lm_head")]
+        if getattr(self, "quantize_mtp", False):
+            prefixes = [p for p in prefixes if p != "mtp"]
         return prefixes
 
     def load_calibration(
