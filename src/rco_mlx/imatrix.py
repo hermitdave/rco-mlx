@@ -93,13 +93,24 @@ _SWIGLU_RENAME = {
 
 
 def _hf_key_candidates(hf_key: str) -> Iterable[str]:
-    """Yield ``hf_key`` plus its SwiGLU projection-name variants."""
+    """Yield ``hf_key`` plus its naming variants.
+
+    Two renamings are handled: the SwiGLU projection spellings (``w1/w2/w3`` vs
+    ``gate_proj/down_proj/up_proj``), and the nested-wrapper layout used by the
+    Qwen3.5/3.6 VLMs, whose HF checkpoint keys (``model.language_model.X`` /
+    ``lm_head.weight``) differ from the MLX module paths the local capture is
+    keyed by (``language_model.model.X`` / ``language_model.lm_head.weight``).
+    """
     yield hf_key
     for old, new in _SWIGLU_RENAME.items():
         if old in hf_key:
             yield hf_key.replace(old, new)
         elif new in hf_key:
             yield hf_key.replace(new, old)
+    if hf_key.startswith("model.language_model."):
+        yield "language_model.model." + hf_key[len("model.language_model."):]
+    if hf_key == "lm_head.weight":
+        yield "language_model.lm_head.weight"
 
 
 def hf_key_to_gguf(hf_key: str) -> Optional[Tuple[str, Optional[int]]]:
