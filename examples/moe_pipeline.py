@@ -533,18 +533,28 @@ def _is_embedding_name(name: str) -> bool:
 
 
 def _filter_bf16_prefixes(assignment: dict[str, int], prefixes: list[str]) -> dict[str, int]:
+    """Drop tensors whose path contains any BF16 prefix as whole components.
+
+    Matching has to be component-aligned: a raw substring test makes the router
+    prefix ``mlp.gate`` swallow ``mlp.gate_proj`` and ``switch_mlp.gate_proj``,
+    and ``feed_forward.gate`` swallow ``feed_forward.gate_proj`` -- silently
+    keeping those weights in BF16 instead of quantizing them.
+    """
+    comps = [p.split(".") for p in prefixes]
     filtered = {}
     for path, bits in assignment.items():
+        parts = path.split(".")
         skip = False
-        for p in prefixes:
-            if p in path:
-                skip = True
-                break
-            if "." in p:
-                last = p.split(".")[-1]
-                if path.endswith("." + last) or ("." + last + ".") in path:
+        for pp in comps:
+            n = len(pp)
+            if n == 0:
+                continue
+            for i in range(len(parts) - n + 1):
+                if parts[i:i + n] == pp:
                     skip = True
                     break
+            if skip:
+                break
         if not skip:
             filtered[path] = bits
     return filtered
@@ -2012,6 +2022,59 @@ def main():
         # Rewrite config keys to the stacked form. Uniformity within each
         # (layer, projection) means every expert carries the same spec, so
         # collapsing the per-expert entries is lossless.
+        cfg_path = output / "config.json"
+        cfg_data = json.loads(cfg_path.read_text())
+        qc = cfg_data.get("quantization", {})
+        final_qc = {}
+        for k, v in qc.items():
+            nk = re.sub(r"\.experts\.\d+\.", ".switch_mlp.", k)
+            if nk in final_qc and final_qc[nk] != v:
+                print(f"  warning: conflicting quantization spec for {nk}")
+            final_qc[nk] = v
+        cfg_data["quantization"] = final_qc
+        cfg_path.write_text(json.dumps(cfg_data, indent=2))
+        print(f"  config rewritten ({len(qc)} -> {len(final_qc)} entries)")
+
+    # Post-process: Flint expert stacking.  Recursive stores routed experts
+    # individually (`mlp.experts.E.{up,down,gate}_proj`); mlx_lm's flint
+    # `sanitize` stacks them into `mlp.switch_mlp.*`.  Same pattern as LFM2, but
+    # under `mlp` rather than `feed_forward`, and the expert count comes from
+    # `num_experts` (uniform across Flint's MoE layers).
+    if args.model_type == "flint":
+        print("[post] stacking Flint per-expert tensors into switch_mlp ...")
+        import os
+        import re
+
+        import safetensors.torch as st
+        import torch
+
+        cfg_data = json.loads((source / "config.json").read_text())
+        num_layers = int(cfg_data["num_hidden_layers"])
+        num_experts = int(cfg_data["num_experts"])
+        dense = set(cfg_data.get("mlp_only_layers") or [])
+        n_stacked = 0
+        for shard_path in sorted(output.glob("*.safetensors")):
+            tensors = st.load_file(str(shard_path))
+            new_tensors = dict(tensors)
+            for l in range(num_layers):
+                if l in dense:
+                    continue
+                prefix = f"model.layers.{l}.mlp"
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    for suffix in ("weight", "scales", "biases"):
+                        keys = [f"{prefix}.experts.{e}.{proj}.{suffix}"
+                                for e in range(num_experts)]
+                        if not all(k in new_tensors for k in keys):
+                            continue
+                        vals = [new_tensors.pop(k) for k in keys]
+                        new_tensors[f"{prefix}.switch_mlp.{proj}.{suffix}"] = \
+                            torch.stack(vals, dim=0).contiguous()
+                        n_stacked += 1
+            tmp_path = "/tmp/" + shard_path.name + ".tmp"
+            st.save_file(new_tensors, tmp_path)
+            os.replace(tmp_path, str(shard_path))
+            print(f"  stacked {shard_path.name} ({n_stacked} tensors)")
+
         cfg_path = output / "config.json"
         cfg_data = json.loads(cfg_path.read_text())
         qc = cfg_data.get("quantization", {})

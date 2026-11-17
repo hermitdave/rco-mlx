@@ -31,7 +31,10 @@ MIN_EXPERT_COUNT = 16
 MIN_EXPERT_COUNT_PERCENTILE = 5
 
 _EXPERT_KEY_RE = re.compile(
-    r"^(?P<base>.+)\.experts\.\d+\.(?P<proj>[A-Za-z0-9_]+)$"
+    # Captures key styles differ: Bolt/LFM2 append `.weight`, the Qwen
+    # profile does not.  Without allowing it, no expert key matches and
+    # the coverage gate silently sees zero expert groups.
+    r"^(?P<base>.+)\.experts\.\d+\.(?P<proj>[A-Za-z0-9_]+(?:\.weight)?)$"
 )
 
 

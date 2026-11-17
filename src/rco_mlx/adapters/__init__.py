@@ -15,6 +15,7 @@ know which model it is running on.
 from .base import ModelAdapter, get, register
 from .default import DefaultAdapter
 from .granitemoehybrid import GraniteMoeHybridAdapter
+from .flint import FlintAdapter
 from .lfm2_moe import Lfm2MoeAdapter
 from .nemotron_h_puzzle import NemotronHPuzzleAdapter
 from .olmoe import OLMoEAdapter

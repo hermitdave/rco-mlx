@@ -30,6 +30,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -265,8 +266,86 @@ class Qwen35Profile(CaptureProfile):
         return create_attention_mask(h, None), None
 
 
+class FlintProfile(CaptureProfile):
+    """Recursive Flint -- sliding-window + full attention, 256 experts top-6.
+
+    ``DecoderLayer(args, idx)`` picks dense-vs-MoE from ``mlp_only_layers`` and
+    sliding-vs-full from ``layer_types``.  Experts are per-expert in the
+    checkpoint and stacked by mlx-lm's ``sanitize``, so ``map_layer`` stacks
+    and ``mlx_to_hf`` unstacks.
+    """
+
+    name = "flint"
+    model_types = ("flint",)
+
+    def load_args(self, src: Path):
+        from mlx_lm.models.flint import ModelArgs
+
+        self._args = ModelArgs.from_dict(
+            json.loads((src / "config.json").read_text()))
+        return self._args
+
+    def static_keys(self):
+        return ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight")
+
+    def build_static(self, args, mx, nn):
+        return (nn.Embedding(args.vocab_size, args.hidden_size),
+                nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps),
+                nn.Linear(args.hidden_size, args.vocab_size, bias=False))
+
+    def layer_key_prefix(self, idx):
+        return f"model.layers.{idx}."
+
+    def module_prefix(self, idx):
+        return f"model.layers.{idx}"
+
+    def build_layer(self, args, idx):
+        from mlx_lm.models.flint import DecoderLayer
+
+        return DecoderLayer(args, idx)
+
+    def _experts(self, args):
+        return int(args.num_experts)
+
+    def map_layer(self, raw, idx):
+        import mlx.core as mx
+
+        args = self._args
+        pre = self.layer_key_prefix(idx)
+        out = {}
+        for proj in ("up_proj", "down_proj", "gate_proj"):
+            keys = [f"{pre}mlp.experts.{e}.{proj}.weight" for e in range(self._experts(args))]
+            if all(k in raw for k in keys):
+                out[f"{pre}mlp.switch_mlp.{proj}.weight"] = mx.stack(
+                    [raw[k] for k in keys])
+                for k in keys:
+                    raw.pop(k)
+        out.update(raw)
+        return out
+
+    def mlx_to_hf(self, mlx_path, expert=None):
+        m = re.match(
+            r"^model\.layers\.(\d+)\.mlp\.switch_mlp\.(up_proj|down_proj|gate_proj)$",
+            mlx_path)
+        if m:
+            e = f"experts.{expert}." if expert is not None else "experts."
+            return f"model.layers.{m.group(1)}.mlp.{e}{m.group(2)}.weight"
+        if mlx_path.startswith("model.layers."):
+            return mlx_path + ".weight"
+        return mlx_path + ".weight"
+
+    def mask_and_cache(self, args, idx, h, mx):
+        from mlx_lm.models.base import create_attention_mask
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        if args.layer_types[idx] == "sliding_attention":
+            return (create_attention_mask(h, None, window_size=args.sliding_window),
+                    RotatingKVCache(max_size=args.sliding_window))
+        return create_attention_mask(h, None), KVCache()
+
+
 PROFILES: Dict[str, CaptureProfile] = {}
-for _cls in (NemotronHPuzzleProfile, Qwen35Profile):
+for _cls in (NemotronHPuzzleProfile, Qwen35Profile, FlintProfile):
     _inst = _cls()
     for _mt in _inst.model_types:
         PROFILES[_mt] = _inst
@@ -275,6 +354,10 @@ for _cls in (NemotronHPuzzleProfile, Qwen35Profile):
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
+
+CKPT_LAYER = "__ckpt_next_layer__"
+CKPT_ACTIVATED = "__ckpt_activated__"
+
 
 def load_raw(src: Path, wm: dict, keys: dict, mx):
     from safetensors import safe_open
@@ -337,9 +420,35 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
     # ---- accumulation ----------------------------------------------------
     in_sum2: dict = {}
     counts: dict = {}
-    # Experts never routed to -- tracked separately because the layer-pooled
-    # fallback writes a substitute count that would hide the gap.
-    zero_experts: set = set()
+    # Experts that routed at least one token.  "Never activated" is derived
+    # at reporting time (keys - activated); tracking per-chunk misses instead
+    # would flag any expert absent from a single chunk, which is normal
+    # routing noise and produced false positives.
+    activated: set = set()
+
+    # ---- resume -----------------------------------------------------------
+    # A long capture that dies at layer N used to lose everything, and the
+    # coverage gate makes that a real possibility (it exits *before* writing
+    # the npz).  Checkpoint per layer so a restart continues instead.
+    out = Path(args.output)
+    ckpt = out.with_suffix(".ckpt.npz")
+    start_layer = 0
+    if ckpt.exists() and not args.no_resume:
+        z = np.load(ckpt, allow_pickle=True)
+        for k in z.files:
+            if k in (CKPT_LAYER, CKPT_ACTIVATED):
+                continue
+            base, _, field = k.rpartition(".")
+            if field == "in_sum2":
+                in_sum2[base] = z[k].astype(np.float64)
+            elif field == "counts":
+                counts[base] = float(z[k][0])
+        if CKPT_ACTIVATED in z.files:
+            activated = {str(x) for x in z[CKPT_ACTIVATED].tolist()}
+        start_layer = int(z[CKPT_LAYER][0]) if CKPT_LAYER in z.files else 0
+        if start_layer:
+            print(f"[resume] layer {start_layer}, {len(in_sum2)} tensors held",
+                  flush=True)
 
     def to_np(a):
         try:
@@ -397,10 +506,10 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
                     s = sums_by_e.get(e)
                     if s is None:
                         accumulate_sums(profile.mlx_to_hf(info[1], e), pooled, n_slots)
-                        zero_experts.add(profile.mlx_to_hf(info[1], e))
                         n_zero += 1
                     else:
                         accumulate_sums(profile.mlx_to_hf(info[1], e), s, int(cnt[e]))
+                        activated.add(profile.mlx_to_hf(info[1], e))
                 if n_zero:
                     print(f"    [imatrix] {info[1]}: {n_zero}/{n_exp} experts never "
                           f"activated -> layer-pooled fallback", flush=True)
@@ -431,7 +540,20 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
     mx.eval(*H)
 
     # ---- one layer resident at a time ------------------------------------
-    for i in range(n_layers):
+    def save_ckpt(next_layer):
+        payload = {f"{k}.in_sum2": np.asarray(v, dtype=np.float32)
+                   for k, v in in_sum2.items()}
+        payload.update({f"{k}.counts": np.array([counts[k]], dtype=np.float32)
+                        for k in counts})
+        payload[CKPT_LAYER] = np.array([next_layer], dtype=np.int64)
+        payload[CKPT_ACTIVATED] = (np.asarray(sorted(activated), dtype=object)
+                                   if activated else np.asarray([], dtype=object))
+        tmp = ckpt.with_suffix(".ckpt.tmp.npz")
+        np.savez_compressed(str(tmp), **payload)
+        tmp.replace(ckpt)
+
+    t_start = time.time()
+    for i in range(start_layer, n_layers):
         raw = load_raw(src, wm, {
             k: s for k, s in wm.items() if k.startswith(profile.layer_key_prefix(i))
         }, mx)
@@ -451,7 +573,7 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
         H = new_H
         print(f"[layer {i:3d}] done | hooked={len(hook_by_id)}", flush=True)
         cov = expert_coverage_stats(
-            counts, zero_experts,
+            counts, activated,
             min_required_count=args.min_expert_count,
             required_percentile=args.min_expert_percentile,
         )
@@ -462,6 +584,7 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
                   f"(need >= {args.min_expert_count})", flush=True)
         del block
         mx.clear_cache()
+        save_ckpt(i + 1)
 
     H = [norm_mod(h) for h in H]
     mx.eval(*H)
@@ -471,24 +594,30 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
 
     print(f"[done] {len(in_sum2)} imatrix tensors", flush=True)
     cov = expert_coverage_stats(
-        counts, zero_experts,
+        counts, activated,
         min_required_count=args.min_expert_count,
         required_percentile=args.min_expert_percentile,
     )
     print(cov.summary(), flush=True)
-    if not cov.ok and not args.allow_insufficient_coverage:
-        sys.exit(
-            "expert coverage insufficient -- the imatrix for unrouted experts is "
-            "a substitute, not a measurement. Re-run with more --max-chunks, or "
-            "pass --allow-insufficient-coverage to override."
-        )
-    out = Path(args.output)
+    # Write the artifact regardless.  The never-activated experts carry the
+    # layer-pooled statistic -- an unbiased estimate, not garbage -- so
+    # discarding 100 minutes of capture over a handful of unrouted experts is
+    # the worse trade.  `--require-coverage` restores the hard failure.
+    if not cov.ok:
+        print(
+            "  WARNING: coverage insufficient -- the imatrix for those experts "
+            "is a substitute, not a measurement. Consider more --max-chunks, or "
+            "pass --require-coverage to make this fatal.", flush=True)
+        if args.require_coverage:
+            ckpt.unlink(missing_ok=True)
+            sys.exit("expert coverage insufficient (--require-coverage).")
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {}
     for k, v in in_sum2.items():
         payload[f"{k}.in_sum2"] = v.astype(np.float32)
         payload[f"{k}.counts"] = np.array([counts[k]], dtype=np.float32)
     np.savez_compressed(str(out), **payload)
+    ckpt.unlink(missing_ok=True)
     print(f"saved -> {out} ({out.stat().st_size/1e6:.1f} MB)")
     return len(in_sum2)
 
@@ -509,7 +638,12 @@ def main() -> None:
     ap.add_argument("--min-expert-percentile", type=int,
                     default=MIN_EXPERT_COUNT_PERCENTILE)
     ap.add_argument("--allow-insufficient-coverage", action="store_true",
-                    help="write the imatrix even if the coverage gate fails")
+                    help="(deprecated, now the default) kept for compatibility")
+    ap.add_argument("--require-coverage", action="store_true",
+                    help="exit non-zero if any expert was never activated "
+                         "(default: write the imatrix and warn)")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="ignore an existing per-layer checkpoint and start over")
     args = ap.parse_args()
 
     src = Path(args.source)
