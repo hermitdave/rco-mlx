@@ -592,6 +592,29 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
         head_mod(h)
     mx.eval()
 
+    # Optional teacher dump: the same layer-at-a-time forward gives BF16
+    # log-softmax rows for models far too large to resident-load (Bolt 149.8
+    # GB, Flint 74 GB).  Format matches eval_kl_top1_split.py's --ref npz.
+    if args.dump_logprobs:
+        lps, ces = [], []
+        for i, h in enumerate(H):
+            logits = head_mod(h)          # nn.Linear -> [1, seq, vocab]
+            logits = logits[0] if logits.ndim == 3 else logits
+            z = logits[:-1].astype(mx.float32)
+            z = z - mx.max(z, axis=-1, keepdims=True)
+            lp = z - mx.log(mx.sum(mx.exp(z), axis=-1, keepdims=True))
+            tgt = ids[i, 1:]
+            picked = mx.take_along_axis(lp, tgt[:, None], axis=-1)[:, 0]
+            ces.append(float(-picked.mean()))
+            lps.append(lp.astype(mx.float16))
+        mx.eval(*lps)
+        np.savez(args.dump_logprobs,
+                 rows=np.asarray(ids).astype(np.int32),
+                 logprobs=np.stack([np.asarray(x) for x in lps]),
+                 ce=np.array(ces))
+        print(f"[logprobs] -> {args.dump_logprobs} "
+              f"({len(lps)} rows x {lps[0].shape[0]} positions)", flush=True)
+
     print(f"[done] {len(in_sum2)} imatrix tensors", flush=True)
     cov = expert_coverage_stats(
         counts, activated,
@@ -644,6 +667,9 @@ def main() -> None:
                          "(default: write the imatrix and warn)")
     ap.add_argument("--no-resume", action="store_true",
                     help="ignore an existing per-layer checkpoint and start over")
+    ap.add_argument("--dump-logprobs", default=None,
+                    help="also dump BF16 teacher log-softmax rows (npz: rows / "
+                         "logprobs / ce) for eval_kl_top1_split.py --ref")
     args = ap.parse_args()
 
     src = Path(args.source)

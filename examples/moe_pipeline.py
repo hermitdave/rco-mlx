@@ -2052,28 +2052,12 @@ def main():
         num_layers = int(cfg_data["num_hidden_layers"])
         num_experts = int(cfg_data["num_experts"])
         dense = set(cfg_data.get("mlp_only_layers") or [])
-        n_stacked = 0
-        for shard_path in sorted(output.glob("*.safetensors")):
-            tensors = st.load_file(str(shard_path))
-            new_tensors = dict(tensors)
-            for l in range(num_layers):
-                if l in dense:
-                    continue
-                prefix = f"model.layers.{l}.mlp"
-                for proj in ("gate_proj", "up_proj", "down_proj"):
-                    for suffix in ("weight", "scales", "biases"):
-                        keys = [f"{prefix}.experts.{e}.{proj}.{suffix}"
-                                for e in range(num_experts)]
-                        if not all(k in new_tensors for k in keys):
-                            continue
-                        vals = [new_tensors.pop(k) for k in keys]
-                        new_tensors[f"{prefix}.switch_mlp.{proj}.{suffix}"] = \
-                            torch.stack(vals, dim=0).contiguous()
-                        n_stacked += 1
-            tmp_path = "/tmp/" + shard_path.name + ".tmp"
-            st.save_file(new_tensors, tmp_path)
-            os.replace(tmp_path, str(shard_path))
-            print(f"  stacked {shard_path.name} ({n_stacked} tensors)")
+        # Recursive ships Flint's BF16 with experts split *across* shards
+        # (layer 5's 256 experts are 128 + 128), so stacking per shard can
+        # never see a complete group -- 75 groups were silently left
+        # per-expert and the checkpoint failed to load.  Merge first.
+        from rco_mlx.expert_stacking import stack_flint_experts
+        stack_flint_experts(output, num_layers, num_experts, dense)
 
         cfg_path = output / "config.json"
         cfg_data = json.loads(cfg_path.read_text())
