@@ -54,7 +54,7 @@ __all__ = [
 # HF per-expert names: ...layers.{L}.mlp.experts.{E}.{projection}
 # (LFM2/LFM2.5 use feed_forward.experts instead of mlp.experts)
 _HF_EXPERT_RE = re.compile(
-    r"layers\.(\d+)\.(?:mlp|feed_forward)\.experts\.(\d+)\.([A-Za-z0-9_]+)"
+    r"layers\.(\d+)\.(?:mlp|feed_forward|mixer)\.experts\.(\d+)\.([A-Za-z0-9_]+)"
 )
 # Granite-4.0-H stores the routed experts pre-stacked (no per-expert index):
 #   layers.{L}.block_sparse_moe.input_linear  ([E, 2*hidden, in], gate+up)

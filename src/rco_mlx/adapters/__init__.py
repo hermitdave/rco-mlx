@@ -16,6 +16,7 @@ from .base import ModelAdapter, get, register
 from .default import DefaultAdapter
 from .granitemoehybrid import GraniteMoeHybridAdapter
 from .lfm2_moe import Lfm2MoeAdapter
+from .nemotron_h_puzzle import NemotronHPuzzleAdapter
 from .olmoe import OLMoEAdapter
 from .qwen3_5_moe import Qwen3NextMoEAdapter
 from .qwen4_exp import Qwen4ExpAdapter
@@ -25,6 +26,7 @@ __all__ = [
     "DefaultAdapter",
     "GraniteMoeHybridAdapter",
     "Lfm2MoeAdapter",
+    "NemotronHPuzzleAdapter",
     "OLMoEAdapter",
     "Qwen3NextMoEAdapter",
     "Qwen4ExpAdapter",

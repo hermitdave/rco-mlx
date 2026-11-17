@@ -85,6 +85,40 @@ class ModelAdapter(ABC):
     def map_key_to_mlx(self, key: str) -> Optional[str]:
         """Map a source checkpoint key to MLX module path, or None to skip."""
 
+    def mlx_model_type(self) -> Optional[str]:
+        """``model_type`` to write into the emitted MLX config.
+
+        None keeps the source value.  Needed when the HF checkpoint is a
+        wrapper architecture (e.g. Nemotron-H *omni*, which bundles vision and
+        sound) whose LLM backbone is what MLX actually loads.
+        """
+        return None
+
+    def prepare_config(self, cfg: dict) -> dict:
+        """Last chance to reshape the source config before MLX keys are written.
+
+        Return a new dict to replace it.  Used when the checkpoint's config
+        layout is not what the MLX loader reads (e.g. a multimodal wrapper
+        nesting every LLM field under ``llm_config``).
+        """
+        return cfg
+
+    def drop_key(self, key: str) -> bool:
+        """True to omit this tensor from the emitted checkpoint entirely.
+
+        Distinct from returning ``None`` from ``map_key_to_mlx`` (which keeps
+        the tensor, unquantized): some checkpoints carry towers the MLX model
+        class has no counterpart for, and those must not be written at all or
+        ``load_weights`` fails with "parameters not in model".
+        """
+        return False
+
+    # Quantized tensors are stored under their MLX name; BF16 fallbacks
+    # historically kept the source name and relied on a per-model sanitize
+    # pass.  Adapters whose HF and MLX names differ set this so both paths
+    # agree and no sanitize is needed.
+    rename_bf16_keys = False
+
     def build_layer_groups(self, layers: List[Dict]) -> List[Dict]:
         """Group layers for RCO allocation. Default: one group per layer."""
         return [

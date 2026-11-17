@@ -81,6 +81,24 @@ def build_layer_groups(
 
     block_pattern = re.compile(r"layers\.(\d+)\.")
 
+    def _compile(pattern: str) -> re.Pattern:
+        """`N` is the wildcard for an index (expert / projection).
+
+        Without this the patterns are literal substrings, and a spec written
+        against the documented `...experts.N.up_proj` form never matches --
+        silently leaving one RCO group per tensor instead of one per
+        (layer, projection).
+        """
+        parts = pattern.split("N")
+        out = []
+        for i, chunk in enumerate(parts):
+            if i:
+                out.append(r"\d+")
+            out.append(re.escape(chunk))
+        return re.compile("".join(out))
+
+    compiled = [[_compile(p) for p in patterns] for patterns in group_patterns]
+
     block_groups: Dict[tuple, List[str]] = {}
     ungrouped: List[str] = []
 
@@ -94,9 +112,9 @@ def build_layer_groups(
         suffix = name[match.end():]
 
         assigned = False
-        for group_idx, patterns in enumerate(group_patterns):
-            for pattern in patterns:
-                if pattern in suffix:
+        for group_idx, pats in enumerate(compiled):
+            for pat in pats:
+                if pat.search(suffix):
                     block_groups.setdefault((block_idx, group_idx), []).append(name)
                     assigned = True
                     break

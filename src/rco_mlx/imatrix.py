@@ -65,8 +65,32 @@ _EXPERT_PATTERNS = [
      "ffn_down_exps"),
     (re.compile(r"layers\.(\d+)\.mlp\.shared_expert\.gate_up_proj"),
      "ffn_gate_shexp"),
+    (re.compile(r"layers\.(\d+)\.mlp\.shared_expert\.gate_proj"),
+     "ffn_gate_shexp"),
+    (re.compile(r"layers\.(\d+)\.mlp\.shared_expert\.up_proj"),
+     "ffn_up_shexp"),
     (re.compile(r"layers\.(\d+)\.mlp\.shared_expert\.down_proj"),
      "ffn_down_shexp"),
+    # LFM2 (`lfm2_moe`): the MoE block is `feed_forward` and SwiGLU is w1/w2/w3,
+    # which `_SWIGLU_RENAME` maps onto gate/down/up.
+    (re.compile(r"layers\.(\d+)\.feed_forward\.experts\.\d+\.gate_up_proj"),
+     "ffn_gate_exps"),
+    (re.compile(r"layers\.(\d+)\.feed_forward\.experts\.\d+\.gate_proj"),
+     "ffn_gate_exps"),
+    (re.compile(r"layers\.(\d+)\.feed_forward\.experts\.\d+\.up_proj"),
+     "ffn_up_exps"),
+    (re.compile(r"layers\.(\d+)\.feed_forward\.experts\.\d+\.down_proj"),
+     "ffn_down_exps"),
+    # Nemotron-H / Bolt (`nemotron_h_puzzle`): the block is `mixer`, the MoE is
+    # latent (fc1/fc2_latent_proj) and attention/mamba live under the same
+    # `mixer` stem. GGUF fuses the per-expert tensors exactly as above.
+    (re.compile(r"layers\.(\d+)\.mixer\.experts\.\d+\.up_proj"), "ffn_up_exps"),
+    (re.compile(r"layers\.(\d+)\.mixer\.experts\.\d+\.down_proj"), "ffn_down_exps"),
+    (re.compile(r"layers\.(\d+)\.mixer\.shared_experts\.up_proj"), "ffn_up_shexp"),
+    (re.compile(r"layers\.(\d+)\.mixer\.shared_experts\.down_proj"),
+     "ffn_down_shexp"),
+    (re.compile(r"layers\.(\d+)\.mixer\.fc1_latent_proj"), "ffn_latent_up"),
+    (re.compile(r"layers\.(\d+)\.mixer\.fc2_latent_proj"), "ffn_latent_down"),
 ]
 _ATTN_PATTERNS = [
     (re.compile(r"layers\.(\d+)\.self_attn\.q_proj"), "attn_q"),
@@ -75,11 +99,18 @@ _ATTN_PATTERNS = [
     (re.compile(r"layers\.(\d+)\.self_attn\.o_proj"), "attn_output"),
     (re.compile(r"layers\.(\d+)\.linear_attn\.in_proj_qkv"), "attn_qkv"),
     (re.compile(r"layers\.(\d+)\.linear_attn\.out_proj"), "ssm_out"),
+    # Nemotron-H / Bolt
+    (re.compile(r"layers\.(\d+)\.mixer\.q_proj"), "attn_q"),
+    (re.compile(r"layers\.(\d+)\.mixer\.k_proj"), "attn_k"),
+    (re.compile(r"layers\.(\d+)\.mixer\.v_proj"), "attn_v"),
+    (re.compile(r"layers\.(\d+)\.mixer\.o_proj"), "attn_output"),
+    (re.compile(r"layers\.(\d+)\.mixer\.in_proj"), "ssm_in"),
+    (re.compile(r"layers\.(\d+)\.mixer\.out_proj"), "ssm_out"),
 ]
 
 
 def _expert_index(hf_key: str) -> Optional[int]:
-    m = re.search(r"\.(?:mlp|feed_forward)\.experts\.(\d+)\.", hf_key)
+    m = re.search(r"\.(?:mlp|feed_forward|mixer)\.experts\.(\d+)\.", hf_key)
     return int(m.group(1)) if m else None
 
 
@@ -102,6 +133,10 @@ def _hf_key_candidates(hf_key: str) -> Iterable[str]:
     keyed by (``language_model.model.X`` / ``language_model.lm_head.weight``).
     """
     yield hf_key
+    # Checkpoints store `.weight`; captures may key either way (Bolt's npz keeps
+    # it, the Qwen profile drops it).  Try both spellings.
+    if hf_key.endswith(".weight"):
+        yield hf_key[: -len(".weight")]
     for old, new in _SWIGLU_RENAME.items():
         if old in hf_key:
             yield hf_key.replace(old, new)
@@ -217,7 +252,9 @@ class Imatrix:
         if mapped is None:
             return None
         gguf_tensor, expert = mapped
-        if gguf_tensor not in self._names:
+        # `_names` holds the raw GGUF tensor names, which carry the
+        # `.in_sum2` / `.counts` suffixes -- the bare stem is never a member.
+        if f"{gguf_tensor}.in_sum2" not in self._names:
             return None
         in_sum2 = self.in_sum2(gguf_tensor).astype(np.float64)
         counts = self.counts(gguf_tensor).astype(np.float64)
@@ -259,36 +296,67 @@ def _normalise_columns(
 # ---------------------------------------------------------------------------
 
 def find_imatrix_on_hf(
-    repo_id: str, filename: Optional[str] = None
+    repo_id: str, filename: Optional[str] = None, repo_type: Optional[str] = None
 ) -> Optional[str]:
     """Return the imatrix filename in a HF repo, or ``None`` if absent.
 
-    Only lists files -- nothing is downloaded.
+    Only lists files -- nothing is downloaded.  ``repo_type`` may be
+    ``"dataset"`` or ``"model"``; when omitted both are tried, dataset first
+    (an imatrix is calibration data, not a model).
     """
     from huggingface_hub import list_repo_files
 
-    try:
-        files = list_repo_files(repo_id)
-    except Exception:
+    for rt in _candidate_repo_types(repo_type):
+        try:
+            files = list_repo_files(repo_id, repo_type=rt)
+        except Exception:
+            continue
+        if filename:
+            return filename if filename in files else None
+        for candidate in files:
+            if any(hint in candidate.lower() for hint in IMATRIX_FILENAME_HINTS):
+                return candidate
         return None
-    if filename:
-        return filename if filename in files else None
-    for candidate in files:
-        if any(hint in candidate.lower() for hint in IMATRIX_FILENAME_HINTS):
-            return candidate
     return None
 
 
-def download_imatrix(repo_id: str, filename: str, local_dir: Path | str) -> Path:
+def _candidate_repo_types(repo_type: Optional[str]) -> list[str]:
+    """Imatrix files are data, so they usually live in a *dataset* repo.
+
+    Try dataset first, then fall back to model repos (bartowski-style
+    imatrix files are shipped inside the quant repo itself).
+    """
+    if repo_type:
+        return [repo_type]
+    return ["dataset", "model"]
+
+
+def download_imatrix(
+    repo_id: str,
+    filename: str,
+    local_dir: Path | str,
+    repo_type: Optional[str] = None,
+) -> Path:
     """Download a published imatrix file into ``local_dir``."""
     from huggingface_hub import hf_hub_download
 
     local_dir = Path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
-    path = hf_hub_download(
-        repo_id=repo_id, filename=filename, local_dir=str(local_dir)
-    )
-    return Path(path)
+    last_exc: Exception | None = None
+    for rt in _candidate_repo_types(repo_type):
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=str(local_dir),
+                repo_type=rt,
+            )
+            return Path(path)
+        except Exception as exc:  # wrong repo type -> try the next
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"no repository type candidate worked for {repo_id}")
 
 
 # ---------------------------------------------------------------------------

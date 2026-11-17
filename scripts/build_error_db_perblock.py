@@ -37,8 +37,21 @@ SKIP_SUBSTRINGS = (
 SKIP_PREFIXES = ("mtp.",)  # MTP head -- BF16 preserved
 
 EXPERT_RE = re.compile(
-    r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.(?:mlp|feed_forward)\.experts)"
+    r"^((?:model\.)?(?:language_model\.)?(?:backbone\.)?layers\.\d+\."
+    r"(?:mlp|feed_forward|mixer)\.experts)"
     r"\.\d+\.([a-z0-9_]+)\.weight$"
+)
+# Some checkpoints (Qwen3.5/3.6 MoE) store the FUSED expert tensors as bare
+# module keys with no `.weight` suffix, e.g.
+#   model.language_model.layers.0.mlp.experts.gate_up_proj   (256, 1024, 2048)
+# A `.weight`-only filter silently drops every routed expert from the error
+# database, the DP then has no expert rows to allocate, and the experts fall
+# back to a default width -- measured: 8-bit experts and a 38 GB artifact
+# where the same recipe gave 19 GB.
+EXPERT_BARE_RE = re.compile(
+    r"^((?:model\.)?(?:language_model\.)?(?:backbone\.)?layers\.\d+\."
+    r"(?:mlp|feed_forward|mixer)\.experts)"
+    r"\.([a-z0-9_]+)$"
 )
 
 
@@ -77,8 +90,8 @@ def is_skipped(key: str, skip_substrings=SKIP_SUBSTRINGS) -> bool:
     return any(s in key for s in skip_substrings)
 
 
-def expert_row_key(key: str):
-    m = EXPERT_RE.match(key)
+def expert_row_key(key):
+    m = EXPERT_RE.match(key) or EXPERT_BARE_RE.match(key)
     if m:
         return f"{m.group(1)}.{m.group(2)}"  # no .weight suffix
     return None
@@ -190,6 +203,9 @@ def main():
     # Legacy passthrough args (ignored; kept for caller compatibility).
     ap.add_argument("--model-type", default=None)
     ap.add_argument("--calibration", default=None)
+    ap.add_argument("--allow-foreign-calibration", action="store_true",
+                    help="Skip the check that --calibration was tokenized with "
+                         "this model's own tokenizer.")
     ap.add_argument("--calibration-dataset", default=None)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--use-gptq", action="store_true", default=False)
@@ -261,7 +277,9 @@ def main():
         n_this = 0
         with safe_open(str(sf), framework="pt", device="cpu") as f:
             for key in f.keys():
-                if not key.endswith(".weight") or is_skipped(key, skip_substrings):
+                if is_skipped(key, skip_substrings):
+                    continue
+                if not (key.endswith(".weight") or EXPERT_BARE_RE.match(key)):
                     continue
                 if key in done_keys:
                     continue

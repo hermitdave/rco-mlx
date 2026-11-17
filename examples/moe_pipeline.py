@@ -289,7 +289,7 @@ def load_error_db(path: Path, group_names: list | None = None) -> tuple[np.ndarr
         for name in group_names:
             row = by_name.get(name) or by_name.get(name + ".weight")
             if row is None:
-                m = _re.match(r"^((?:model\.)?(?:language_model\.)?layers\.\d+\.(?:mlp|feed_forward)\.experts)\.\d+\.([a-z0-9_]+)$", name)
+                m = _re.match(r"^((?:model\.)?(?:language_model\.)?(?:backbone\.)?layers\.\d+\.(?:mlp|feed_forward|mixer)\.experts)\.\d+\.([a-z0-9_]+)$", name)
                 if m:
                     row = by_name.get(f"{m.group(1)}.{m.group(2)}")
             if row is None:
@@ -472,6 +472,15 @@ def emit_and_validate(
         mode=quant_mode,
         group_size_map=group_size_map,
     )
+    if not quant_assignment:
+        # An empty map silently produces a checkpoint whose weights are all
+        # quantized but whose config declares nothing -- it then fails to
+        # load, or worse, loads as dense.  Never emit one.
+        raise RuntimeError(
+            "allocation produced zero quantizable tensors -- check the "
+            "adapter's non_quantized_prefixes (matched by raw substring in "
+            "_filter_bf16_prefixes) and _is_quantizable"
+        )
 
     base_cfg_path = source_dir / "config.json"
     base_cfg = json.loads(base_cfg_path.read_text()) if base_cfg_path.exists() else {}
@@ -767,6 +776,15 @@ def stream_quantize(
         assignment, group_size=group_size, mode=quant_mode,
         group_size_map=group_size_map,
     )
+    # Expert bits are a property of the (layer, projection) group, but
+    # ``assignment`` is keyed by the group's representative name (expert 0).
+    # Index them by group so every expert resolves to its group's bitwidth
+    # instead of falling through to the 4-bit default.
+    expert_group_bits: dict[tuple, int] = {}
+    for path, bits in assignment.items():
+        gk = expert_group_key(path)
+        if gk is not None:
+            expert_group_bits[gk] = bits
     layer_bits = {}
     layer_gs: dict[str, int] = {}
     layer_clip: dict[str, float] = {}
@@ -875,23 +893,9 @@ def stream_quantize(
             base = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
             bits = layer_bits.get(base, None)
             if bits is None and ".experts." in base:
-                parts = base.split(".")
-                try:
-                    experts_idx = parts.index("experts")
-                    proj = parts[experts_idx + 2]
-                    # layer index follows the "layers" component in both
-                    # model.layers.N.* and model.language_model.layers.N.*
-                    l = parts[parts.index("layers") + 1]
-                    for prefix in ["feed_forward", "mlp"]:
-                        stacked_key = f"model.layers.{l}.{prefix}.{proj}"
-                        if stacked_key in layer_bits:
-                            bits = layer_bits[stacked_key]
-                            break
-                        if stacked_key + ".weight" in layer_bits_with_suffix:
-                            bits = layer_bits_with_suffix[stacked_key + ".weight"]
-                            break
-                except (ValueError, IndexError):
-                    pass
+                gk = expert_group_key(base)
+                if gk is not None and gk in expert_group_bits:
+                    bits = expert_group_bits[gk]
         if bits is None:
             bits = 4
         base = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
@@ -903,6 +907,7 @@ def stream_quantize(
     n_pg_search = 0
     n_lsq = 0
     n_3d_skipped = 0
+    n_dropped = 0
     clip_hist: dict[float, int] = {}
     start = time.time()
 
@@ -911,6 +916,9 @@ def stream_quantize(
         results = {}
         with safe_open(str(shard_path), framework="pt", device="cpu") as f:
             for key in f.keys():
+                if model_adapter is not None and model_adapter.drop_key(key):
+                    n_dropped += 1
+                    continue
                 mlx_key = map_key_to_mlx(key)
                 if mlx_key is None:
                     results[key] = f.get_tensor(key).to(torch.bfloat16)
@@ -1016,7 +1024,12 @@ def stream_quantize(
                     else:
                         results[mlx_key] = tensor.to(torch.bfloat16)
                 else:
-                    results[key] = f.get_tensor(key).to(torch.bfloat16)
+                    out_key = (
+                        mlx_key
+                        if (model_adapter is not None and model_adapter.rename_bf16_keys)
+                        else key
+                    )
+                    results[out_key] = f.get_tensor(key).to(torch.bfloat16)
 
         # N-gram PLE tensors go into their own file(s) so the lookup
         # table (tens of GB) can be moved / kept on host SSD separately
@@ -1067,6 +1080,33 @@ def stream_quantize(
             print(f"  {v:.2f}: {clip_hist[v]} ({100*clip_hist[v]/total:.1f}%)")
 
 
+def ensure_calibration_matches_model(
+    source: Path, calib_path: Path | None, allow_foreign: bool = False
+) -> None:
+    """Refuse a calibration cache that is not in this model's vocabulary.
+
+    A cache tokenized with a different model's tokenizer measures
+    off-vocabulary activations; the imatrix and the error DB then describe a
+    model that does not exist, and nothing downstream complains.  The check is
+    intrinsic to the tokenizer (decode -> encode must round-trip exactly), so
+    it needs no dataset download.
+    """
+    if calib_path is None or not Path(calib_path).exists():
+        return
+    try:
+        from rco_mlx.calibration import verify_calibration
+    except Exception:
+        return
+    rep = verify_calibration(source, calib_path)
+    print(rep.summary())
+    if not rep.ok and not allow_foreign:
+        sys.exit(
+            "calibration cache does not match this model's tokenizer. Rebuild "
+            "it (scripts/build_calibration_for_model.py) or pass "
+            "--allow-foreign-calibration to override."
+        )
+
+
 def write_output_index(output_dir: Path) -> None:
     """Write ``model.safetensors.index.json`` for every shard in the output.
 
@@ -1098,6 +1138,11 @@ def _rewrite_config_mlx_keys(output_dir: Path, model_adapter, quant_mode: str = 
         return
     with open(cfg_path) as f:
         cfg = json.load(f)
+    cfg = model_adapter.prepare_config(cfg)
+    mlx_type = model_adapter.mlx_model_type()
+    if mlx_type:
+        cfg["model_type"] = mlx_type
+        cfg.pop("architectures", None)
     quant = cfg.get("quantization", {})
     new_quant = {}
     for key, val in quant.items():
@@ -1291,6 +1336,9 @@ def main():
                          "transformer. Omit on a dense model to auto-select "
                          "'default'.")
     ap.add_argument("--calibration", default=None, help="Path to calibration .npy")
+    ap.add_argument("--allow-foreign-calibration", action="store_true",
+                    help="Skip the check that --calibration was tokenized with "
+                         "this model's own tokenizer. Only for experiments.")
     ap.add_argument("--calibration-dataset", default=None, help="Auto-generate calib: wikitext|fineweb|c4")
     ap.add_argument("--calibration-bos", action="store_true",
                     help="Prepend the tokenizer's bos_token_id to each calibration "
@@ -1445,7 +1493,14 @@ def main():
 
     # --- Step 1: introspect ---
     print("[1/5] introspecting model …")
-    layer_names, param_counts, groups = introspect_model(source, model_adapter=model_adapter)
+    # The adapter's grouping_spec must actually reach introspect_model: with
+    # group_spec=None every module becomes its own RCO group, so per-projection
+    # expert grouping silently never happens (measured: 28725 groups on Bolt,
+    # 1045 on Qwen3.6 -- i.e. one per tensor).
+    _group_spec = model_adapter.grouping_spec() if model_adapter is not None else None
+    layer_names, param_counts, groups = introspect_model(
+        source, group_spec=_group_spec, model_adapter=model_adapter
+    )
     group_names = [g.layer_names[0] for g in groups]
     print(f"  {len(layer_names)} layers, {len(groups)} groups")
 
@@ -1583,6 +1638,9 @@ def main():
                 calib_path = Path(args.calibration).expanduser().resolve()
                 if not calib_path.exists():
                     sys.exit(f"Calibration file not found: {calib_path}")
+                ensure_calibration_matches_model(
+                    source, calib_path, args.allow_foreign_calibration
+                )
             elif args.calibration_dataset:
                 calib_path = build_calibration_from_dataset(
                     source_dir=source,
@@ -1830,8 +1888,16 @@ def main():
             new_tensors = dict(tensors)
             num_layers = 40
             num_experts = 256
-            for l in range(num_layers):
-                prefix = f"language_model.model.layers.{l}.mlp"
+            # The appended MTP predictor ships in the same fused `experts.*`
+            # layout as the trunk, and mlx-lm expects the same switch_mlp.*
+            # split for both. Skipping mtp.* leaves the head unloadable: fused
+            # names plus scales/biases flattened to (E*out, in/gs).
+            _cfg = _json.loads((output / "config.json").read_text())
+            _tc = _cfg.get("text_config", _cfg)
+            n_mtp = int(_tc.get("mtp_num_hidden_layers", 1) or 1)
+            prefixes = [f"language_model.model.layers.{l}.mlp" for l in range(num_layers)]
+            prefixes += [f"mtp.layers.{l}.mlp" for l in range(n_mtp)]
+            for prefix in prefixes:
                 for suffix in [".weight", ".scales", ".biases"]:
                     gate_up_key = f"{prefix}.experts.gate_up_proj{suffix}"
                     down_key = f"{prefix}.experts.down_proj{suffix}"
@@ -1890,8 +1956,17 @@ def main():
         if isinstance(qc, dict):
             final_qc = {}
             for k, v in qc.items():
-                nk = k.replace("experts.gate_up_proj", "switch_mlp.gate_proj")
-                nk = nk.replace("experts.down_proj", "switch_mlp.down_proj")
+                if "experts.gate_up_proj" in k:
+                    # The fused tensor is split into gate_proj + up_proj and both
+                    # halves are quantized at the same width, so BOTH need a
+                    # config entry.  Emitting only gate_proj leaves up_proj to
+                    # the loader default (4-bit) -- harmless at 4 bpw, but a
+                    # shape mismatch the moment the DP picks 2-bit.
+                    base = k.replace("experts.gate_up_proj", "switch_mlp")
+                    final_qc[f"{base}.gate_proj"] = v
+                    final_qc[f"{base}.up_proj"] = dict(v) if isinstance(v, dict) else v
+                    continue
+                nk = k.replace("experts.down_proj", "switch_mlp.down_proj")
                 final_qc[nk] = v
             cfg_data["quantization"] = final_qc
             cfg_path.write_text(json.dumps(cfg_data, indent=2))
@@ -1943,6 +2018,109 @@ def main():
         final_qc = {}
         for k, v in qc.items():
             nk = re.sub(r"\.experts\.\d+\.", ".switch_mlp.", k)
+            if nk in final_qc and final_qc[nk] != v:
+                print(f"  warning: conflicting quantization spec for {nk}")
+            final_qc[nk] = v
+        cfg_data["quantization"] = final_qc
+        cfg_path.write_text(json.dumps(cfg_data, indent=2))
+        print(f"  config rewritten ({len(qc)} -> {len(final_qc)} entries)")
+
+    # Post-process: Nemotron-H Puzzle / Bolt expert stacking.
+    # HF stores the routed experts individually (experts.E.{up,down}_proj);
+    # MLX SwitchLinear wants one stacked tensor per projection, named
+    # fc1/fc2. The expert count varies per layer, so read it from
+    # block_configs rather than assuming one global value.
+    if args.model_type == "nemotron_h_puzzle":
+        print("[post] stacking Nemotron-H per-expert tensors into switch_mlp ...")
+        import os
+        import re as _re2
+
+        import safetensors.torch as st
+        import torch
+
+        cfg_data = json.loads((source / "config.json").read_text())
+        llm = cfg_data.get("llm_config", cfg_data)
+        blocks = llm.get("block_configs") or []
+        n_layers = len(blocks) if blocks else int(llm.get("num_hidden_layers", 88))
+
+        def _n_experts(l: int) -> int:
+            if l < len(blocks):
+                return int(blocks[l].get("n_routed_experts") or 0)
+            return 0
+
+        n_stacked = 0
+        shards = sorted(output.glob("*.safetensors"))
+        key_re = _re2.compile(
+            r"^backbone\.layers\.(\d+)\.mixer\.experts\.(\d+)\."
+            r"(up_proj|down_proj)\.(weight|scales|biases)$"
+        )
+
+        # A layer's 240-496 experts are spread over SEVERAL shards, so
+        # stacking shard-by-shard can never see a whole group.  Locate every
+        # expert tensor first, then stack per (layer, projection) group.
+        groups: dict = {}
+        for si, sp in enumerate(shards):
+            with st.safe_open(str(sp), framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    m = key_re.match(k)
+                    if m:
+                        groups.setdefault((int(m.group(1)), m.group(3)), {}).setdefault(
+                            m.group(4), []
+                        ).append((si, k))
+
+        writes: dict = {}
+        deletes: dict = {}
+        for (layer, proj), suffixes in sorted(groups.items()):
+            n_exp = _n_experts(layer)
+            carrier = "fc1" if proj == "up_proj" else "fc2"
+            for suffix, items in suffixes.items():
+                if not n_exp or len(items) != n_exp:
+                    print(
+                        f"  WARNING layer {layer} {proj}.{suffix}: {len(items)} "
+                        f"tensors, expected {n_exp} -- left unstacked"
+                    )
+                    continue
+                items.sort(key=lambda t: int(key_re.match(t[1]).group(2)))
+                loaded = {}
+                by_shard: dict = {}
+                for si, k in items:
+                    by_shard.setdefault(si, []).append(k)
+                for si, ks in by_shard.items():
+                    with st.safe_open(str(shards[si]), framework="pt", device="cpu") as f:
+                        for k in ks:
+                            loaded[k] = f.get_tensor(k)
+                    deletes.setdefault(si, set()).update(ks)
+                stacked = torch.stack([loaded[k] for _, k in items], dim=0).contiguous()
+                writes.setdefault(items[0][0], {})[
+                    f"backbone.layers.{layer}.mixer.switch_mlp.{carrier}.{suffix}"
+                ] = stacked
+                n_stacked += 1
+
+        for si, sp in enumerate(shards):
+            if si not in writes and si not in deletes:
+                continue
+            with st.safe_open(str(sp), framework="pt", device="cpu") as f:
+                tensors = {k: f.get_tensor(k) for k in f.keys()}
+            for k in deletes.get(si, ()):
+                tensors.pop(k, None)
+            tensors.update(writes.get(si, {}))
+            tmp_path = "/tmp/" + sp.name + ".tmp"
+            st.save_file(tensors, tmp_path)
+            os.replace(tmp_path, str(sp))
+            print(
+                f"  stacked {sp.name} (+{len(writes.get(si, {}))} "
+                f"/ -{len(deletes.get(si, {}))})"
+            )
+        print(f"  total stacked tensors: {n_stacked}")
+
+        cfg_path = output / "config.json"
+        cfg_data = json.loads(cfg_path.read_text())
+        qc = cfg_data.get("quantization", {})
+        final_qc = {}
+        for k, v in qc.items():
+            nk = _re2.sub(r"\.experts\.\d+\.", ".switch_mlp.", k)
+            nk = nk.replace(".switch_mlp.up_proj", ".switch_mlp.fc1")
+            nk = nk.replace(".switch_mlp.down_proj", ".switch_mlp.fc2")
             if nk in final_qc and final_qc[nk] != v:
                 print(f"  warning: conflicting quantization spec for {nk}")
             final_qc[nk] = v
@@ -2026,6 +2204,12 @@ def main():
 
     print(f"Config: {output / 'config.json'}")
     print(f"{'='*60}")
+
+    # The quantizer writes model.safetensors.index.json while streaming, but
+    # the post-process steps above (Qwen3.5 sanitize, LFM2/Nemotron expert
+    # stacking) rename and merge tensors in place.  Rebuild the index from
+    # what is actually on disk, otherwise keys point at the wrong shard.
+    write_output_index(output)
 
     # Summary
     bit_hist = Counter(assignment.values())
