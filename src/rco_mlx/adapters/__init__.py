@@ -21,6 +21,7 @@ from .nemotron_h_puzzle import NemotronHPuzzleAdapter
 from .olmoe import OLMoEAdapter
 from .qwen3_5_moe import Qwen3NextMoEAdapter
 from .qwen4_exp import Qwen4ExpAdapter
+from .sensenova_loop import SenseNovaLoopAdapter
 
 __all__ = [
     "ModelAdapter",
@@ -31,6 +32,7 @@ __all__ = [
     "OLMoEAdapter",
     "Qwen3NextMoEAdapter",
     "Qwen4ExpAdapter",
+    "SenseNovaLoopAdapter",
     "register",
     "get",
 ]

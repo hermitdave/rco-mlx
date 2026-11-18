@@ -79,7 +79,9 @@ def main():
     chunks = [calib[i : i + 1].astype(np.int32) for i in range(n_rows)]
 
     print("Loading model (capture hooks installed before first forward)...", flush=True)
-    model, tok = mlx_lm.load(str(args.source))
+    # Architectures that ship their model class as ``model_file`` (e.g.
+    # sensenova_loop) raise unless trust_remote_code is set.
+    model, tok = mlx_lm.load(str(args.source), trust_remote_code=True)
 
     in_sum2: dict[str, np.ndarray] = {}
     counts: dict[str, float] = {}
