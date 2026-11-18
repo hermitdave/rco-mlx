@@ -55,7 +55,7 @@ def main():
     rows = calib[: args.samples, : args.max_tokens].astype(np.int32)
 
     print(f"Loading BF16 reference: {args.bf16}")
-    model_ref, _ = load(args.bf16)
+    model_ref, _ = load(args.bf16, trust_remote_code=True)
     model_ref.eval()
 
     results = []
@@ -63,7 +63,7 @@ def main():
         for spec in args.quant:
             name, path = spec.split("=", 1)
             print(f"\nLoading {name}: {path}")
-            model_q, _ = load(path)
+            model_q, _ = load(path, trust_remote_code=True)
             model_q.eval()
 
             tot_ce, tot_kl, tot_t1, n_tok = 0.0, 0.0, 0.0, 0

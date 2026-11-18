@@ -427,6 +427,17 @@ def resolve_imatrix(args, source: Path, output: Path) -> Path | None:
             "--calibration", str(calib),
             "--output", str(imatrix_path),
         ]
+        # Use every calibration row: ``--max-chunks`` defaults to 8, which
+        # silently discards most of a 128x2048 cache and thins the activation
+        # statistics that both the error DB weighting and the per-group clip
+        # search depend on.
+        try:
+            import numpy as _np
+            _rows = int(_np.load(calib, mmap_mode="r").shape[0])
+            cmd += ["--max-chunks", str(_rows)]
+            print(f"imatrix capture rows: {_rows}")
+        except Exception as exc:  # noqa: BLE001 - fall back to the script default
+            print(f"could not read calibration row count ({exc}); using default")
         print(f"Building local imatrix: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
