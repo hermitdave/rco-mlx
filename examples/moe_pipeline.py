@@ -1341,6 +1341,28 @@ def build_calibration_from_dataset(
 # Main
 # ---------------------------------------------------------------------------
 
+def param_weighted_bpw(assignment: dict[str, int], param_counts: dict[str, int]) -> float:
+    """Parameter-weighted mean nominal bitwidth of an allocation.
+
+    An unweighted mean over groups is misleading: a group with a few hundred
+    parameters counts exactly as much as one with tens of millions, so it can
+    read far above (or below) what the checkpoint actually costs on disk.
+    """
+    total = 0
+    weighted = 0.0
+    for name, bits in assignment.items():
+        pc = (
+            param_counts.get(name, 0)
+            or param_counts.get(name + ".weight", 0)
+            or param_counts.get(name.removesuffix(".weight"), 0)
+        )
+        if not pc:
+            continue
+        total += pc
+        weighted += int(bits) * pc
+    return weighted / total if total else 0.0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="RCO mixed-precision quantization pipeline (dense + MoE, "
@@ -2271,10 +2293,11 @@ def main():
 
     # Summary
     bit_hist = Counter(assignment.values())
-    actual_bits = np.array([effective_bits(int(bw), args.group_size) for bw in assignment.values()])
-    achieved_effective = float(actual_bits.mean())
+    allocated = param_weighted_bpw(assignment, param_counts)
+    out_bytes = sum(p.stat().st_size for p in output.glob("*.safetensors"))
     print(f"\nTarget: {args.target_bpw:.2f} bpw (nominal)")
-    print(f"Achieved effective bpw: {achieved_effective:.4f} (includes scale overhead)")
+    print(f"Allocated bpw (parameter-weighted, nominal): {allocated:.4f}")
+    print(f"On-disk checkpoint: {out_bytes / 1e9:.2f} GB")
     print(f"Quantized tensors: {len(assignment)}")
     print(f"Bitwidth distribution:")
     for bw in sorted(bit_hist.keys(), reverse=True):
