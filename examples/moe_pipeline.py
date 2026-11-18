@@ -2298,10 +2298,21 @@ def main():
     print(f"\nTarget: {args.target_bpw:.2f} bpw (nominal)")
     print(f"Allocated bpw (parameter-weighted, nominal): {allocated:.4f}")
     print(f"On-disk checkpoint: {out_bytes / 1e9:.2f} GB")
-    print(f"Quantized tensors: {len(assignment)}")
-    print(f"Bitwidth distribution:")
-    for bw in sorted(bit_hist.keys(), reverse=True):
-        print(f"  {int(bw)}-bit: {bit_hist[bw]} tensors")
+    # The allocation covers every group, including BF16-preserved ones
+    # (norms, conv1d, routers, vision); only the emitted config describes what
+    # is actually quantized, so report the distribution from there.
+    try:
+        _cfg = json.loads((output / "config.json").read_text()).get("quantization", {})
+        _q = Counter(
+            int(v["bits"]) for v in _cfg.values()
+            if isinstance(v, dict) and "bits" in v
+        )
+    except Exception:
+        _q = Counter()
+    print(f"Quantized tensors: {sum(_q.values())} (allocation covered {len(assignment)} groups)")
+    print(f"Bitwidth distribution (on disk):")
+    for bw in sorted(_q.keys(), reverse=True):
+        print(f"  {bw}-bit: {_q[bw]} tensors")
 
 
 if __name__ == "__main__":
