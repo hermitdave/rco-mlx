@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
+from mlx.utils import tree_flatten
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -316,11 +317,17 @@ class FlintProfile(CaptureProfile):
         for proj in ("up_proj", "down_proj", "gate_proj"):
             keys = [f"{pre}mlp.experts.{e}.{proj}.weight" for e in range(self._experts(args))]
             if all(k in raw for k in keys):
-                out[f"{pre}mlp.switch_mlp.{proj}.weight"] = mx.stack(
+                out[f"mlp.switch_mlp.{proj}.weight"] = mx.stack(
                     [raw[k] for k in keys])
                 for k in keys:
                     raw.pop(k)
-        out.update(raw)
+        # Names must be *layer-relative*: nn.Module.load_weights matches against
+        # the module's own parameter paths, so passing the full HF path makes
+        # every key unmatched.  With strict=False that silently loads NOTHING
+        # and the forward runs on randomly-initialised weights -- the capture
+        # then produces a plausible-looking but worthless imatrix.
+        for k, v in raw.items():
+            out[k[len(pre):] if k.startswith(pre) else k] = v
         return out
 
     def mlx_to_hf(self, mlx_path, expert=None):
@@ -560,8 +567,21 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
         mapped = profile.map_layer(raw, i)
         del raw
         block = profile.build_layer(margs, i)
-        block.load_weights(list(mapped.items()), strict=False)
+        mapped_items = list(mapped.items())
+        block.load_weights(mapped_items, strict=False)
         del mapped
+        # strict=False silently skips unmatched names.  That is exactly how a
+        # prefix bug once made a whole capture run on randomly-initialised
+        # layers and still emit plausible-looking imatrix statistics, so
+        # verify rather than trust.
+        tails = {".".join(k.split(".")[-2:]) for k, _ in mapped_items}
+        leaves = dict(tree_flatten(block.parameters()))
+        unmatched = [k for k in leaves if ".".join(k.split(".")[-2:]) not in tails]
+        if unmatched:
+            sys.exit(
+                f"layer {i}: {len(unmatched)}/{len(leaves)} parameters unmatched "
+                f"by map_layer (e.g. {unmatched[:3]}).  Check that map_layer "
+                f"emits layer-relative names and covers every parameter.")
         mx.eval(block.parameters())
         register(block, profile.module_prefix(i))
 
