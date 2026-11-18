@@ -42,3 +42,19 @@ class SenseNovaLoopAdapter(DefaultAdapter):
 
     def drop_key(self, key: str) -> bool:
         return key.startswith(_DROP_PREFIXES)
+
+    def prepare_config(self, cfg: dict) -> dict:
+        """Emit a config that stock ``mlx_lm`` loads with no custom code.
+
+        The checkpoint ships a vestigial ``loop_gate.logits`` tensor that the
+        upstream modeling code never reads and the registered
+        ``mlx_lm.models.sensenova_loop`` class does not declare, so loading an
+        unmodified checkpoint raises "parameters not in model".  The quantized
+        output simply omits that tensor, which makes a ``model_file`` override
+        unnecessary -- and ``model_file`` is what forces
+        ``trust_remote_code=True``.  Drop it so the artifact loads with a
+        plain ``mlx_lm.load(path)``.
+        """
+        cfg = dict(cfg)
+        cfg.pop("model_file", None)
+        return cfg
