@@ -394,6 +394,25 @@ def load_raw(src: Path, wm: dict, keys: dict, mx):
     return out
 
 
+def load_layer_weights(block, mapped, module_prefix):
+    """Load mapped layer tensors into a standalone layer module.
+
+    ``map_layer`` may emit FULL module paths (``language_model.model.layers.N.…``)
+    but a standalone block's ``load_weights`` expects RELATIVE keys and silently
+    skips everything else under ``strict=False`` -- a whole qwen3_5 capture once
+    ran on randomly-initialised layers because of this (teacher PPL ~1.5M).
+    Strip the prefix here, and return the exact set of unmatched parameter
+    leaves so callers can fail loudly. A tail-only comparison does NOT catch
+    this: the last two components match even when the full path is wrong.
+    """
+    pre = module_prefix + "."
+    rel = {(k[len(pre):] if k.startswith(pre) else k): v for k, v in mapped.items()}
+    block.load_weights(list(rel.items()), strict=False)
+    leaves = dict(tree_flatten(block.parameters()))
+    unmatched = [k for k in leaves if k not in rel]
+    return rel, unmatched
+
+
 def capture(profile: CaptureProfile, src: Path, args) -> int:
     import mlx.core as mx
     import mlx.nn as nn
@@ -584,21 +603,16 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
         mapped = profile.map_layer(raw, i)
         del raw
         block = profile.build_layer(margs, i)
-        mapped_items = list(mapped.items())
-        block.load_weights(mapped_items, strict=False)
+        # Strip full module paths to layer-relative keys and verify EVERY
+        # parameter leaf was loaded (strict=False skips silently; a tail-only
+        # check misses full-path mismatches -- see load_layer_weights).
+        _, unmatched = load_layer_weights(block, mapped, profile.module_prefix(i))
         del mapped
-        # strict=False silently skips unmatched names.  That is exactly how a
-        # prefix bug once made a whole capture run on randomly-initialised
-        # layers and still emit plausible-looking imatrix statistics, so
-        # verify rather than trust.
-        tails = {".".join(k.split(".")[-2:]) for k, _ in mapped_items}
-        leaves = dict(tree_flatten(block.parameters()))
-        unmatched = [k for k in leaves if ".".join(k.split(".")[-2:]) not in tails]
         if unmatched:
             sys.exit(
-                f"layer {i}: {len(unmatched)}/{len(leaves)} parameters unmatched "
+                f"layer {i}: {len(unmatched)} parameters unmatched "
                 f"by map_layer (e.g. {unmatched[:3]}).  Check that map_layer "
-                f"emits layer-relative names and covers every parameter.")
+                f"covers every parameter of the layer module.")
         mx.eval(block.parameters())
         register(block, profile.module_prefix(i))
 

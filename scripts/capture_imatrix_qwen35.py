@@ -30,7 +30,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from capture_imatrix_streaming import PROFILES  # noqa: E402
+from capture_imatrix_streaming import PROFILES, load_layer_weights  # noqa: E402
 from rco_mlx.calibration import (  # noqa: E402
     MIN_EXPERT_COUNT,
     MIN_EXPERT_COUNT_PERCENTILE,
@@ -253,8 +253,13 @@ def main() -> None:
         mapped = profile.map_layer(raw, i)
         del raw
         block = profile.build_layer(margs, i)
-        block.load_weights(list(mapped.items()), strict=False)
+        # Full module paths must be stripped to layer-relative keys, and every
+        # parameter leaf verified loaded (strict=False skips silently).
+        _, unmatched = load_layer_weights(block, mapped, profile.module_prefix(i))
         del mapped
+        if unmatched:
+            sys.exit(f"layer {i}: {len(unmatched)} parameters unmatched by "
+                     f"map_layer (e.g. {unmatched[:3]})")
         mx.eval(block.parameters())
         register(block, profile.module_prefix(i))
 
