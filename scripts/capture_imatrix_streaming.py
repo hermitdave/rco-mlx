@@ -65,6 +65,11 @@ class CaptureProfile:
     def build_static(self, args, mx, nn):
         """Return ``(embedding, norm, head)`` modules."""
 
+    def sanitize_static(self, key, v):
+        """Optional per-family sanitize for static tensors (default identity).
+        Needed when the final norm is delta-encoded (+1.0) like the layer norms."""
+        return v
+
     def layer_key_prefix(self, idx: int) -> str:
         """HF key prefix selecting one layer's tensors from the index."""
 
@@ -227,6 +232,13 @@ class Qwen35Profile(CaptureProfile):
         if any(mlx_key.endswith(s) for s in self._NORM_SUFFIXES) and v.ndim == 1:
             v = v + 1.0
         return v
+
+    def sanitize_static(self, key, v):
+        """The FINAL norm is delta-encoded too (+1.0); loading it raw while
+        layer norms are shifted produced teacher PPL ~394k on Qwen3.8-27B.
+        Map the HF static key to its MLX name so _sanitize's suffix list hits."""
+        mlx = key.replace("model.language_model.", "language_model.model.")
+        return self._sanitize(mlx, v)
 
     def map_layer(self, raw, idx):
         out = {}
@@ -405,7 +417,10 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
     norm_key = next(k for k in static_raw if "norm" in k and "embed" not in k)
     head_key = next(k for k in static_raw if "lm_head" in k)
     embed_mod.load_weights([("weight", static_raw[embed_key])], strict=False)
-    norm_mod.load_weights([("weight", static_raw[norm_key])], strict=False)
+    norm_w = static_raw[norm_key]
+    if hasattr(profile, "sanitize_static"):
+        norm_w = profile.sanitize_static(norm_key, norm_w)
+    norm_mod.load_weights([("weight", norm_w)], strict=False)
     head_mod.load_weights([("weight", static_raw[head_key])], strict=False)
     del static_raw
     mx.eval(embed_mod.parameters(), norm_mod.parameters(), head_mod.parameters())
