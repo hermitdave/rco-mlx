@@ -244,7 +244,9 @@ class Qwen35Profile(CaptureProfile):
                 out[mlx[:-len(".mlp.experts.down_proj")]
                     + ".mlp.switch_mlp.down_proj.weight"] = v
                 continue
-            out[mlx if mlx.endswith(".weight") else mlx + ".weight"] = v
+            out[mlx if (mlx.endswith(".weight")
+                        or mlx.rsplit(".", 1)[-1] in ("A_log", "dt_bias"))
+                else mlx + ".weight"] = v
         return out
 
     def mlx_to_hf(self, mlx_path, expert=None):
