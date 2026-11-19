@@ -99,6 +99,19 @@ _ATTN_PATTERNS = [
     (re.compile(r"layers\.(\d+)\.self_attn\.o_proj"), "attn_output"),
     (re.compile(r"layers\.(\d+)\.linear_attn\.in_proj_qkv"), "attn_qkv"),
     (re.compile(r"layers\.(\d+)\.linear_attn\.out_proj"), "ssm_out"),
+    # Qwen3.5/3.8 dense hybrid (GatedDeltaNet): the remaining input projections.
+    # in_proj_z/a/b all consume the SAME hidden state as in_proj_qkv, and the
+    # unsloth imatrix confirms their in_sum2 vectors are bit-identical, so the
+    # alpha/beta spelling choice is statistically neutral.
+    (re.compile(r"layers\.(\d+)\.linear_attn\.in_proj_z"), "attn_gate"),
+    (re.compile(r"layers\.(\d+)\.linear_attn\.in_proj_a"), "ssm_alpha"),
+    (re.compile(r"layers\.(\d+)\.linear_attn\.in_proj_b"), "ssm_beta"),
+    # Dense (non-MoE) SwiGLU MLPs: ffn_gate/up/down. Expert patterns above run
+    # first; `mlp.gate_proj` never matches `mlp.experts.N.gate_proj` or
+    # `mlp.shared_expert.gate_proj` (literal component match).
+    (re.compile(r"layers\.(\d+)\.mlp\.gate_proj"), "ffn_gate"),
+    (re.compile(r"layers\.(\d+)\.mlp\.up_proj"), "ffn_up"),
+    (re.compile(r"layers\.(\d+)\.mlp\.down_proj"), "ffn_down"),
     # Nemotron-H / Bolt
     (re.compile(r"layers\.(\d+)\.mixer\.q_proj"), "attn_q"),
     (re.compile(r"layers\.(\d+)\.mixer\.k_proj"), "attn_k"),

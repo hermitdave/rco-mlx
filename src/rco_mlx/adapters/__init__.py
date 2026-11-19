@@ -19,6 +19,7 @@ from .flint import FlintAdapter
 from .lfm2_moe import Lfm2MoeAdapter
 from .nemotron_h_puzzle import NemotronHPuzzleAdapter
 from .olmoe import OLMoEAdapter
+from .qwen3_5 import Qwen35DenseAdapter
 from .qwen3_5_moe import Qwen3NextMoEAdapter
 from .qwen4_exp import Qwen4ExpAdapter
 
@@ -29,6 +30,7 @@ __all__ = [
     "Lfm2MoeAdapter",
     "NemotronHPuzzleAdapter",
     "OLMoEAdapter",
+    "Qwen35DenseAdapter",
     "Qwen3NextMoEAdapter",
     "Qwen4ExpAdapter",
     "register",

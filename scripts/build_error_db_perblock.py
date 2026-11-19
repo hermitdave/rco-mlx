@@ -33,6 +33,10 @@ SKIP_SUBSTRINGS = (
     "ngram_embedding",   # 51B PLE table -- uniform 3-bit, not RCO
     "embed_tokens",      # BF16 preserved
     "lm_head",           # BF16 preserved
+    "norm",              # every *norm* is BF16 (_is_quantizable excludes them);
+                         # measuring them wastes I/O and taxes the DP budget
+    "visual",            # VLM vision tower -- BF16/grafted, never RCO-allocated
+    "conv1d",            # depthwise conv, last dim not group-divisible
 )
 SKIP_PREFIXES = ("mtp.",)  # MTP head -- BF16 preserved
 
