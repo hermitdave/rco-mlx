@@ -1455,6 +1455,12 @@ def main():
                          "the head 8-bit because it is small). The MTP group size "
                          "is reset to --group-size so a low width is not paired "
                          "with a coarse gs128")
+    ap.add_argument("--uniform-bits", type=int, default=None,
+                    help="Force one bitwidth on every RCO-managed module, "
+                         "discarding the DP assignment. Reaches the model's "
+                         "feasibility floor (the cheapest option set) and gives "
+                         "a uniform-width baseline. MTP is still governed by "
+                         "--mtp-bits, the n-gram table by --ngram-bits.")
     ap.add_argument("--imatrix", default=None,
                     help="Path to a GGUF imatrix file or local .npz; weights the "
                          "error DB per input column by activation importance")
@@ -1816,6 +1822,17 @@ def main():
                     assignment[k] = int(args.mtp_bits)
             if n_over:
                 print(f"  MTP override: {n_over} tensors -> {args.mtp_bits}-bit")
+
+        if args.uniform_bits:
+            # Force one width on every RCO-managed module. This is the only way
+            # to reach the model's feasibility floor (the cheapest option set),
+            # and the standard recipe for a uniform-width baseline.
+            n_over = sum(1 for k in assignment if "mtp" not in k)
+            for k in assignment:
+                if "mtp" not in k:
+                    assignment[k] = int(args.uniform_bits)
+            print(f"  uniform override: {n_over} modules -> "
+                  f"{args.uniform_bits}-bit (floor build)")
 
         # Expert allocation (MoE only). The sanitize constraint is uniformity
         # *within* each stacked (layer, projection) tensor, not across the
