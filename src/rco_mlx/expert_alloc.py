@@ -115,6 +115,15 @@ def is_expert_name(name: str) -> bool:
     low = name.lower()
     if "shared_expert" in low or "shared" in low:
         return False
+    if low.startswith("mtp.") or ".mtp." in low:
+        # MTP-head layers are indexed independently of the trunk
+        # (``mtp.layers.0`` is not trunk layer 0). Grouping them under the
+        # trunk (layer, projection) key makes ``enforce_group_uniformity``
+        # majority-vote across the two and silently override trunk expert
+        # widths -- measured on a synthetic checkpoint: 2 of 4 expert groups
+        # jumped to the loader default. MTP experts are single pre-stacked
+        # tensors, so they need no cross-member uniformity.
+        return False
     if low.endswith(".mlp.gate") or low.endswith(".switch_mlp.gate"):
         return False
     if low.endswith(".mlp.gate.weight") or low.endswith(".switch_mlp.gate.weight"):
