@@ -44,6 +44,7 @@ class Qwen4ExpAdapter(ModelAdapter):
         "conv.conv",
         "conv1d",
         "visual",
+        "vision_tower",
         "mtp",
     )
 
@@ -109,10 +110,14 @@ class Qwen4ExpAdapter(ModelAdapter):
             " linear_attn.in_proj_a,linear_attn.in_proj_b,linear_attn.in_proj_qkv,linear_attn.in_proj_z,linear_attn.out_proj"
             " model.language_model.layers.N.mlp.experts.N.down_proj"
             " model.language_model.layers.N.mlp.experts.N.gate_up_proj"
+            # Pre-stacked (fused) form: one tensor per (layer, projection),
+            # no per-expert index -- Qwen4-Exp / Qwen3.6 storage.
+            " model.language_model.layers.N.mlp.experts.down_proj"
+            " model.language_model.layers.N.mlp.experts.gate_up_proj"
         )
 
     def non_quantized_prefixes(self) -> List[str]:
-        prefixes = list(self._BF16_PREFIXES)
+        prefixes: List[str] = list(self._BF16_PREFIXES)
         if getattr(self, 'quantize_mtp', False):
             prefixes = [p for p in prefixes if p != 'mtp']
         return prefixes
@@ -141,4 +146,9 @@ class Qwen4ExpAdapter(ModelAdapter):
         if ".mlp.shared_expert." in mlx:
             mlx = mlx.replace(".mlp.shared_expert.down_proj.", ".mlp.shared_expert.down_proj.")
             mlx = mlx.replace(".mlp.shared_expert.gate_up_proj.", ".mlp.shared_expert.gate_proj.")
+        # Vision tower: HF stores `model.visual.*`; the MLX model class (and
+        # oMLX's sanitize_key) expects `vision_tower.*`. Leaving it as
+        # `visual.*` makes load_weights reject the whole tower.
+        if mlx.startswith("visual."):
+            mlx = "vision_tower." + mlx[len("visual."):]
         return mlx

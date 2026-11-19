@@ -60,6 +60,7 @@ from rco_mlx.expert_alloc import (
     expert_group_key,
     fill_missing_expert_groups,
     mask_values_below_min_bits,
+    mask_values_not_in_bits,
     uniform_expert_bits,
 )
 
@@ -202,6 +203,7 @@ def run_rco_allocation(
     group_is_expert: list[bool] | None = None,
     group_is_embedding: list[bool] | None = None,
     embedding_min_bits: int = 2,
+    expert_bits: list[int] | None = None,
 ) -> tuple[dict[str, int], dict]:
     table = LossTable(
         losses=losses,
@@ -226,6 +228,15 @@ def run_rco_allocation(
         )
         print(f"  embedding floor: {embedding_min_bits}-bit minimum enforced "
               f"in DP ({sum(group_is_embedding)} embedding groups)")
+    if expert_bits:
+        if group_is_expert is None:
+            sys.exit("--expert-bits requires expert group flags")
+        values = mask_values_not_in_bits(
+            values, bitwidths, group_is_expert, expert_bits
+        )
+        print(f"  expert whitelist: experts restricted to "
+              f"{sorted(int(b) for b in expert_bits)}-bit "
+              f"({sum(group_is_expert)} expert groups)")
     idx = budget_dp(
         values, table.fracs, table.actual_bits(), target_bpw, resolution=10000
     )
@@ -734,6 +745,8 @@ def stream_quantize(
     clip_max_bits: int = 8,
     hessian_dir: Path | None = None,
     scale_dtype: str = "float16",
+    ngram_bits: int | None = None,
+    ngram_group_size: int | None = None,
 ):
     """Stream through BF16 source, quantize per allocation, write shards.
 
@@ -892,7 +905,7 @@ def stream_quantize(
         # N-gram PLE table first: its name contains "embed", which the
         # generic exclusion below would incorrectly match.
         if model_adapter is not None and hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
-            return True, model_adapter.ngram_quant_bits, model_adapter.ngram_group_size, 1.0
+            return True, (ngram_bits or model_adapter.ngram_quant_bits), (ngram_group_size or model_adapter.ngram_group_size), 1.0
         if (
             "norm" in mlx_key
             or (not quant_embed and ("embed" in mlx_key or "lm_head" in mlx_key))
@@ -905,7 +918,7 @@ def stream_quantize(
         if model_adapter is not None:
             # N-gram PLE table: uniform quantization at adapter-specified bits/group.
             if hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
-                return True, model_adapter.ngram_quant_bits, model_adapter.ngram_group_size, 1.0
+                return True, (ngram_bits or model_adapter.ngram_quant_bits), (ngram_group_size or model_adapter.ngram_group_size), 1.0
             for prefix in model_adapter.non_quantized_prefixes():
                 if f".{prefix}." in f".{mlx_key}." or mlx_key.startswith(f"{prefix}.") or mlx_key == prefix:
                     return False, 4, gs, 1.0
@@ -1409,6 +1422,19 @@ def main():
                          "choose options >= this width and the DP compensates by "
                          "lowering non-expert widths. 2 = no floor (default). "
                          "Note: a floor can make a low target infeasible.")
+    ap.add_argument("--expert-bits", default=None,
+                    help="Whitelist of routed-expert bitwidths, comma-separated "
+                         "(e.g. '2,3'). The DP may only place expert groups at "
+                         "these widths -- the 'at most N expert bitwidths' "
+                         "constraint. Non-expert tensors are unaffected. "
+                         "Incompatible with --expert-allocation uniform/gguf-recipe.")
+    ap.add_argument("--ngram-bits", type=int, default=None,
+                    help="Override the n-gram PLE table bitwidth (adapter "
+                         "default: qwen4_exp 3-bit). The table is outside the "
+                         "RCO budget; use this to A/B 4/6/8-bit tables.")
+    ap.add_argument("--ngram-group-size", type=int, default=None,
+                    help="Override the n-gram PLE group size (adapter default: "
+                         "qwen4_exp 32; 32 is required for 160-wide PLE rows).")
     ap.add_argument("--quantize-embeddings", action="store_true",
                     help="Dense models: quantize embed_tokens/lm_head through the "
                          "DP instead of keeping them BF16. Needed to compare "
@@ -1754,6 +1780,10 @@ def main():
                 ],
                 group_is_embedding=[_is_embedding_name(n) for n in c_names],
                 embedding_min_bits=args.embedding_min_bits,
+                expert_bits=(
+                    [int(b) for b in args.expert_bits.split(",")]
+                    if args.expert_bits else None
+                ),
             )
             assignment = {
                 group_names[i]: c_assignment[c_names[j]]
@@ -1771,6 +1801,10 @@ def main():
                 ],
                 group_is_embedding=[_is_embedding_name(n) for n in group_names],
                 embedding_min_bits=args.embedding_min_bits,
+                expert_bits=(
+                    [int(b) for b in args.expert_bits.split(",")]
+                    if args.expert_bits else None
+                ),
             )
         print(f"  achieved {report['achieved_bpw']:.4f} bpw")
         print(f"  histogram: {report['bit_histogram']}")
@@ -1919,24 +1953,30 @@ def main():
         lsq_refit=args.lsq_refit,
         clip_grid=clip_grid, clip_max_bits=args.clip_max_bits,
         hessian_dir=args.hessian_dir, scale_dtype=args.scale_dtype,
+        ngram_bits=args.ngram_bits, ngram_group_size=args.ngram_group_size,
     )
 
-    # Post-process: apply Qwen3.5 sanitize for quantized weights
-    if args.model_type == "qwen3_5_moe":
-        print("[post] applying Qwen3.5 sanitize for quantized expert weights ...")
+    # Post-process: apply the Qwen3.5/Qwen4-Exp sanitize for quantized weights.
+    # Both families store routed experts as ONE fused 3-D tensor per
+    # (layer, projection) -- `...mlp.experts.gate_up_proj` [E, 2H, in] and
+    # `...mlp.experts.down_proj` [E, out, in] -- while mlx-lm's loader stacks
+    # them into `switch_mlp.{gate,up,down}_proj`. Without this split the
+    # artifact fails to load ("Received N parameters not in model").
+    if args.model_type in ("qwen3_5_moe", "qwen4_exp"):
+        print(f"[post] applying {args.model_type} sanitize for quantized expert weights ...")
         import json as _json
         import safetensors.torch as st
+        _cfg = _json.loads((output / "config.json").read_text())
+        _tc = _cfg.get("text_config", _cfg)
+        num_layers = int(_tc.get("num_hidden_layers", 40))
+        num_experts = int(_tc.get("num_experts", 256))
         for shard_path in sorted(output.glob("*.safetensors")):
             tensors = st.load_file(str(shard_path))
             new_tensors = dict(tensors)
-            num_layers = 40
-            num_experts = 256
             # The appended MTP predictor ships in the same fused `experts.*`
             # layout as the trunk, and mlx-lm expects the same switch_mlp.*
             # split for both. Skipping mtp.* leaves the head unloadable: fused
             # names plus scales/biases flattened to (E*out, in/gs).
-            _cfg = _json.loads((output / "config.json").read_text())
-            _tc = _cfg.get("text_config", _cfg)
             n_mtp = int(_tc.get("mtp_num_hidden_layers", 1) or 1)
             prefixes = [f"language_model.model.layers.{l}.mlp" for l in range(num_layers)]
             prefixes += [f"mtp.layers.{l}.mlp" for l in range(n_mtp)]

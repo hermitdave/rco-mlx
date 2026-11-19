@@ -45,6 +45,7 @@ __all__ = [
     "gguf_recipe_bits",
     "apply_gguf_recipe",
     "mask_values_below_min_bits",
+    "mask_values_not_in_bits",
     "GGUF_GATE_UP_XXS_LAYERS",
     "GGUF_DOWN_IQ4_LAYERS",
     "GGUF_DOWN_225_LAYERS",
@@ -61,6 +62,17 @@ _HF_EXPERT_RE = re.compile(
 #   layers.{L}.block_sparse_moe.output_linear ([E, in, hidden], down)
 _HF_GRANITE_EXPERT_RE = re.compile(
     r"layers\.(\d+)\.block_sparse_moe\.(input_linear|output_linear)"
+)
+# Qwen4-Exp / Qwen3.6 store the routed experts pre-stacked as ONE fused tensor
+# per (layer, projection) with no per-expert index and no `.weight` suffix:
+#   layers.{L}.mlp.experts.gate_up_proj  ([E, 2H, in])
+#   layers.{L}.mlp.experts.down_proj     ([E, out, in])
+# The per-expert regex above cannot match these; without a bare form every
+# routed expert is treated as an ordinary tensor, so `--expert-min-bits`,
+# `--expert-bits` and the uniformity enforcement silently do not apply.
+_HF_BARE_EXPERT_RE = re.compile(
+    r"layers\.(\d+)\.(?:mlp|feed_forward|mixer)\.experts\.([A-Za-z0-9_]+)"
+    r"(?:\.(?:weight|scales|biases))?$"
 )
 # MLX stacked names: ...switch_mlp.{projection} (single tensor per layer)
 _MLX_STACKED_RE = re.compile(
@@ -109,6 +121,7 @@ def is_expert_name(name: str) -> bool:
         return False
     return bool(
         _HF_EXPERT_RE.search(name)
+        or _HF_BARE_EXPERT_RE.search(name)
         or _HF_GRANITE_EXPERT_RE.search(name)
         or _MLX_STACKED_RE.search(name)
         or _MLX_FEED_FORWARD_RE.search(name)
@@ -126,6 +139,9 @@ def expert_group_key(name: str) -> Optional[Tuple[int, str]]:
     m = _HF_EXPERT_RE.search(name)
     if m:
         return int(m.group(1)), m.group(3)
+    m = _HF_BARE_EXPERT_RE.search(name)
+    if m:
+        return int(m.group(1)), m.group(2)
     m = _HF_GRANITE_EXPERT_RE.search(name)
     if m:
         return int(m.group(1)), m.group(2)
@@ -313,6 +329,40 @@ def mask_values_below_min_bits(
     if min_bits <= int(widths.min()):
         return masked
     disallowed = widths < min_bits
+    for g, is_expert in enumerate(group_is_expert):
+        if is_expert:
+            masked[g, disallowed] = -np.inf
+    return masked
+
+
+def mask_values_not_in_bits(
+    values: np.ndarray,
+    bitwidths: Sequence[int] | np.ndarray,
+    group_is_expert: Sequence[bool],
+    allowed_bits: Sequence[int],
+) -> np.ndarray:
+    """Restrict expert groups to a whitelist of bitwidths inside the DP.
+
+    Where :func:`mask_values_below_min_bits` forbids everything below a floor,
+    this forbids everything *outside* an explicit set -- the "at most two
+    expert bitwidths" constraint. Masking before ``budget_dp`` keeps the
+    assignment budget-feasible: the DP compensates for a narrower expert menu
+    by reallocating non-expert widths. If no allowed option fits the target,
+    ``budget_dp`` raises its infeasibility error, which is the correct signal
+    that the whitelist and the target are incompatible.
+    """
+    values_arr = np.asarray(values, dtype=np.float64)
+    widths = np.asarray(bitwidths)
+    if values_arr.ndim != 2 or values_arr.shape[0] != len(group_is_expert):
+        raise ValueError(
+            f"values must be (n_groups, n_options) with n_groups == "
+            f"len(group_is_expert); got {values_arr.shape} vs {len(group_is_expert)}"
+        )
+    allowed = {int(b) for b in allowed_bits}
+    masked = values_arr.copy()
+    disallowed = np.array([int(b) not in allowed for b in widths], dtype=bool)
+    if not disallowed.any():
+        return masked
     for g, is_expert in enumerate(group_is_expert):
         if is_expert:
             masked[g, disallowed] = -np.inf
