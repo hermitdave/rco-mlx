@@ -16,6 +16,7 @@ from .base import ModelAdapter, get, register
 from .default import DefaultAdapter
 from .granitemoehybrid import GraniteMoeHybridAdapter
 from .flint import FlintAdapter
+from .inkling2_loop import Inkling2LoopAdapter
 from .lfm2_moe import Lfm2MoeAdapter
 from .nemotron_h_puzzle import NemotronHPuzzleAdapter
 from .olmoe import OLMoEAdapter
@@ -27,6 +28,7 @@ __all__ = [
     "ModelAdapter",
     "DefaultAdapter",
     "GraniteMoeHybridAdapter",
+    "Inkling2LoopAdapter",
     "Lfm2MoeAdapter",
     "NemotronHPuzzleAdapter",
     "OLMoEAdapter",

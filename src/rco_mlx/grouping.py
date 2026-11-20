@@ -200,8 +200,22 @@ def get_layer_to_group_mapping(groups: List[LayerGroup]) -> Dict[str, int]:
 
 
 def get_group_param_count(group: LayerGroup, param_counts: Dict[str, int]) -> int:
-    """Total parameter count for a group."""
-    return sum(param_counts.get(name, 1) for name in group.layer_names)
+    """Total parameter count for a group.
+
+    ``param_counts`` is keyed by tensor name (``...weight``) while a group's
+    ``layer_names`` are module paths, so try the bare name and the ``.weight``
+    form.  The default of 1 for a miss is what let a whole model report a
+    near-zero parameter total.
+    """
+    total = 0
+    for name in group.layer_names:
+        if name in param_counts:
+            total += param_counts[name]
+        elif name + ".weight" in param_counts:
+            total += param_counts[name + ".weight"]
+        else:
+            total += 1
+    return total
 
 
 def attach_param_counts(

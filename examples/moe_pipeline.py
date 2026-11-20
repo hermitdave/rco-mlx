@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 from collections import Counter
 import shutil
 import subprocess
@@ -96,10 +97,17 @@ def introspect_model(source_dir: Path, group_spec: str | None = None, model_adap
             )
 
     param_counts = {}
-    with safe_open(str(shards[0]), framework="pt", device="cpu") as f:
-        for key in f.keys():
-            shape = f.get_tensor(key).shape
-            param_counts[key] = int(np.prod(shape))
+    # Every shard, not just the first: a multi-shard source otherwise reports
+    # param_count 0 for every module that lives past shard 0, and the DP then
+    # treats ~all of the model as free.
+    for shard in shards:
+        with open(shard, "rb") as fh:
+            header_len = struct.unpack("<Q", fh.read(8))[0]
+            header = json.loads(fh.read(header_len))
+        for key, info in header.items():
+            if key == "__metadata__":
+                continue
+            param_counts[key] = int(np.prod(info["shape"]))
 
     group_patterns = None
     if group_spec:
@@ -1239,7 +1247,8 @@ def _rewrite_config_mlx_keys(output_dir: Path, model_adapter, quant_mode: str = 
 # MoE auto-detection
 # ---------------------------------------------------------------------------
 
-_MOE_ADAPTERS = {"olmoe", "qwen3_5_moe", "qwen4_exp", "lfm2_moe", "granitemoehybrid"}
+_MOE_ADAPTERS = {"olmoe", "qwen3_5_moe", "qwen4_exp", "lfm2_moe", "granitemoehybrid",
+                 "inkling2_loop"}
 
 
 def detect_moe_model(source_dir: Path, model_type: str | None) -> bool:
