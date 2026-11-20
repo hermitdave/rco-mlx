@@ -759,6 +759,18 @@ def stream_quantize(
     """
     import torch
 
+    def _bf16_or_original(t):
+        """Downcast floating tensors to bf16 but leave integer/bool alone.
+
+        Checkpoints carry integer metadata next to the weights -- qwen4_exp's
+        PLE ``layer_multipliers`` / ``ngram_heads_offsets`` /
+        ``ngram_heads_vocab_sizes`` are int64. Forcing them to bf16 silently
+        changes both values and dtype, and oMLX's ``_ngram_indices`` then dies
+        with ``[bitwise_xor] Only allowed on integer or boolean types but got
+        bfloat16``. Floating-point tensors keep the old normalisation.
+        """
+        return t.to(torch.bfloat16) if t.dtype.is_floating_point else t
+
     def _to_scale(arr: np.ndarray, dtype: str):
         if dtype == "bfloat16":
             return torch.from_numpy(arr.astype(np.float32)).to(torch.bfloat16)
@@ -955,7 +967,7 @@ def stream_quantize(
                     continue
                 mlx_key = map_key_to_mlx(key)
                 if mlx_key is None:
-                    results[key] = f.get_tensor(key).to(torch.bfloat16)
+                    results[key] = _bf16_or_original(f.get_tensor(key))
                     continue
 
                 q_ok, bits, q_gs, q_clip = should_quantize(mlx_key)
@@ -971,7 +983,7 @@ def stream_quantize(
                     if tensor.shape[-1] % q_gs != 0:
                         print(f"  {mlx_key}: last dim {tensor.shape[-1]} not divisible "
                               f"by group {q_gs} -> keeping BF16")
-                        results[key] = tensor.to(torch.bfloat16)
+                        results[key] = _bf16_or_original(tensor)
                         continue
                     if tensor.ndim == 2:
                         w_np = tensor.float().numpy()
@@ -1056,14 +1068,14 @@ def stream_quantize(
 
                         _store_scales(results, base_key, scales_np, biases_np, quant_mode)
                     else:
-                        results[mlx_key] = tensor.to(torch.bfloat16)
+                        results[mlx_key] = _bf16_or_original(tensor)
                 else:
                     out_key = (
                         mlx_key
                         if (model_adapter is not None and model_adapter.rename_bf16_keys)
                         else key
                     )
-                    results[out_key] = f.get_tensor(key).to(torch.bfloat16)
+                    results[out_key] = _bf16_or_original(f.get_tensor(key))
 
         # N-gram PLE tensors go into their own file(s) so the lookup
         # table (tens of GB) can be moved / kept on host SSD separately
