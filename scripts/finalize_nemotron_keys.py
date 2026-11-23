@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rename + prune an already-quantized Nemotron-H checkpoint in place.
 
-``moe_pipeline.py`` writes quantized tensors under their MLX name but BF16
+``rco_pipeline.py`` writes quantized tensors under their MLX name but BF16
 fallbacks under the *source* name, and it has no way to omit tensors whose
 tower has no MLX counterpart.  The pipeline now does both correctly (see
 ``NemotronHPuzzleAdapter.map_key_to_mlx`` / ``drop_key``); this script applies

@@ -1,7 +1,7 @@
 # Dense RCO on LFM3-1.7B — head-to-head with MACaQ
 
 Dense-model support lives in `rco-mlx` (generic `default` adapter + MoE
-detection in `examples/moe_pipeline.py`). LFM3-1.7B was chosen for the first
+detection in `examples/rco_pipeline.py`). LFM3-1.7B was chosen for the first
 dense validation because a MACaQ checkpoint and its benchmark numbers already
 exist locally, so the comparison uses one identical protocol.
 
@@ -154,7 +154,7 @@ SRC=~/Projects/ml/models/LFM3-1.7B-BF16
 CAL=$SRC/work/calib_wikitext_128x2048.npy   # or --calibration-dataset wikitext
 
 # best quality point (0.972 GB, 4.50 bpw) — capture imatrix once, reuse after
-PYTHONPATH=$PWD/src python3 examples/moe_pipeline.py \
+PYTHONPATH=$PWD/src python3 examples/rco_pipeline.py \
     --source $SRC --output ~/Projects/ml/models/LFM3-1.7B-MLX-RCO-embed-mixed-pgc-45 \
     --target-bpw 4.25 --group-size 64 --calibration $CAL \
     --bits 3,4,6,8 --quantize-embeddings --embedding-min-bits 4 \
@@ -162,7 +162,7 @@ PYTHONPATH=$PWD/src python3 examples/moe_pipeline.py \
 
 # matched-size point (0.918 GB, 4.25 bpw), reusing the captured imatrix
 IM=~/Projects/ml/models/LFM3-1.7B-MLX-RCO-embed-mixed-pgc-45/work/imatrix.npz
-PYTHONPATH=$PWD/src python3 examples/moe_pipeline.py \
+PYTHONPATH=$PWD/src python3 examples/rco_pipeline.py \
     --source $SRC --output ~/Projects/ml/models/LFM3-1.7B-MLX-RCO-embed-mixed-pgc \
     --target-bpw 4.0 --group-size 64 --calibration $CAL \
     --bits 3,4,6,8 --quantize-embeddings --embedding-min-bits 4 \

@@ -25,8 +25,8 @@ def test_lfm2_conv_prefix_does_not_overmatch_conv_projections():
     prefixes = Lfm2MoeAdapter().non_quantized_prefixes()
     assert "conv.conv" not in prefixes
 
-    p = _P(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
-    spec = importlib.util.spec_from_file_location("moe_pipeline", p)
+    p = _P(__file__).resolve().parent.parent / "examples" / "rco_pipeline.py"
+    spec = importlib.util.spec_from_file_location("rco_pipeline", p)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
 

@@ -11,7 +11,7 @@ done group-wise across the whole directory -- a per-shard pass silently
 leaves most experts unstacked and the checkpoint then fails to load with
 "Received N parameters not in model".
 
-Run after ``moe_pipeline.py`` (the pipeline does this itself; this script
+Run after ``rco_pipeline.py`` (the pipeline does this itself; this script
 exists to repair an artifact built before the fix, and for verification).
 """
 

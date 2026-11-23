@@ -33,7 +33,7 @@ property for both speed and quality.
 || `mlx_alloc.py` | — | New. Emits the MLX config block. |
 || `validate.py` | — | New. Structural checks before a load. |
 || `scripts/build_moe_error_db.py` | — | Self-contained streaming error_db builder with GPTQ + batched experts. |
-| `examples/moe_pipeline.py` | — | End-to-end pipeline (dense + MoE): introspect → error_db → RCO → quantize. |
+| `examples/rco_pipeline.py` | — | End-to-end pipeline (dense + MoE): introspect → error_db → RCO → quantize. |
 
 **The one design change that matters.** The original drives the optimizer from
 a live PyTorch model: it registers a parametrization on every layer's weight,
@@ -164,7 +164,7 @@ automatically via `rco_mlx.get("my_moe")`.
 ### Running the pipeline
 
 ```bash
-python examples/moe_pipeline.py \
+python examples/rco_pipeline.py \
     --source /path/to/bf16-moe \
     --output /path/to/output \
     --target-bpw 3.5 \
@@ -252,7 +252,7 @@ checkpoint uses `layers.N.*` naming. One RCO group per tensor; norms,
 embeddings, `lm_head`, MTP and vision towers stay BF16.
 
 ```bash
-python examples/moe_pipeline.py \
+python examples/rco_pipeline.py \
     --source /path/to/bf16-dense \
     --output /path/to/output \
     --target-bpw 4.0 \
@@ -350,7 +350,7 @@ python -m rco_mlx.scripts.build_moe_error_db \
     --use-gptq
 
 # Phase 2: Run RCO allocation + quantization
-python examples/moe_pipeline.py \
+python examples/rco_pipeline.py \
     --source /path/to/olmoe-bf16 \
     --output /path/to/output \
     --target-bpw 4.0 \
@@ -396,7 +396,7 @@ or layers. `--expert-allocation` selects how routed experts get their bits:
   expert weights vs 42.3 GB measured in the GGUF.
 
 ```bash
-python examples/moe_pipeline.py \
+python examples/rco_pipeline.py \
     --source /path/to/bf16-qwen4exp \
     --output /path/to/output \
     --target-bpw 3.0 --group-size 64 --model-type qwen4_exp \

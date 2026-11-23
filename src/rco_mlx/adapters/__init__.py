@@ -8,7 +8,7 @@ Each supported model gets a small adapter class that describes:
   - how to group layers for RCO allocation
   - how to load calibration data
 
-The pipeline (moe_pipeline.py) calls the adapter; it does not need to
+The pipeline (rco_pipeline.py) calls the adapter; it does not need to
 know which model it is running on.
 """
 

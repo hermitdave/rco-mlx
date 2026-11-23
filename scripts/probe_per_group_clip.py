@@ -37,8 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from rco_mlx.imatrix import Imatrix  # noqa: E402
 
-_PIPE = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
-_spec = importlib.util.spec_from_file_location("moe_pipeline", _PIPE)
+_PIPE = Path(__file__).resolve().parent.parent / "examples" / "rco_pipeline.py"
+_spec = importlib.util.spec_from_file_location("rco_pipeline", _PIPE)
 _pipe = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pipe)
 

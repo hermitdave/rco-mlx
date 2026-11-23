@@ -114,8 +114,8 @@ def test_per_group_clip_search_reduces_weighted_mse():
 
     from rco_mlx.imatrix import Imatrix  # noqa: F401  (ensure import path)
 
-    pipe = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
-    spec = importlib.util.spec_from_file_location("moe_pipeline", pipe)
+    pipe = Path(__file__).resolve().parent.parent / "examples" / "rco_pipeline.py"
+    spec = importlib.util.spec_from_file_location("rco_pipeline", pipe)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
@@ -148,8 +148,8 @@ def test_per_group_clip_search_reduces_weighted_mse():
 def test_per_group_clip_search_unweighted_matches_plain_mse():
     import importlib.util
 
-    pipe = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
-    spec = importlib.util.spec_from_file_location("moe_pipeline", pipe)
+    pipe = Path(__file__).resolve().parent.parent / "examples" / "rco_pipeline.py"
+    spec = importlib.util.spec_from_file_location("rco_pipeline", pipe)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
@@ -170,8 +170,8 @@ def test_per_group_clip_search_unweighted_matches_plain_mse():
 def test_imatrix_col_weights_helper(tmp_path):
     import importlib.util
 
-    pipe = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
-    spec = importlib.util.spec_from_file_location("moe_pipeline", pipe)
+    pipe = Path(__file__).resolve().parent.parent / "examples" / "rco_pipeline.py"
+    spec = importlib.util.spec_from_file_location("rco_pipeline", pipe)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
@@ -199,8 +199,8 @@ def test_imatrix_col_weights_helper(tmp_path):
 def test_apply_clips_respects_per_group_ratio():
     import importlib.util
 
-    pipe = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
-    spec = importlib.util.spec_from_file_location("moe_pipeline", pipe)
+    pipe = Path(__file__).resolve().parent.parent / "examples" / "rco_pipeline.py"
+    spec = importlib.util.spec_from_file_location("rco_pipeline", pipe)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 

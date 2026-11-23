@@ -31,8 +31,8 @@ def keys():
 def test_registered_not_moe():
     assert "qwen3_5" in registered_names()
     assert get("qwen3_5") is Qwen35DenseAdapter
-    import moe_pipeline
-    assert "qwen3_5" not in moe_pipeline._MOE_ADAPTERS
+    import rco_pipeline
+    assert "qwen3_5" not in rco_pipeline._MOE_ADAPTERS
 
 
 def test_drop_decisions(keys):

@@ -19,7 +19,8 @@ calib = ["transformers>=4.0", "datasets>=3.0"]
 test = ["pytest>=7"]
 
 [project.scripts]
-rco-moe-quant = "examples.moe_pipeline:main"
+rco-quant = "examples.rco_pipeline:main"
+rco-moe-quant = "examples.rco_pipeline:main"  # deprecated alias
 
 [tool.setuptools.packages.find]
 where = ["src"]

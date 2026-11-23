@@ -92,8 +92,8 @@ def test_default_adapter_nested_wrapper_translation():
 
 def test_detect_moe_model_false_for_dense(tmp_path: Path):
     _write_fake_dense(tmp_path)
-    p = Path(__file__).resolve().parent.parent / "examples" / "moe_pipeline.py"
-    spec = importlib.util.spec_from_file_location("moe_pipeline", p)
+    p = Path(__file__).resolve().parent.parent / "examples" / "rco_pipeline.py"
+    spec = importlib.util.spec_from_file_location("rco_pipeline", p)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     assert m.detect_moe_model(tmp_path, None) is False
