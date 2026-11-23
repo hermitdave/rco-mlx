@@ -118,10 +118,15 @@ def verify_calibration(
     ids = np.asarray(arr[: min(sample_rows, n_rows)]).astype(np.int64)
 
     # Round-trip: decode then re-encode.  Exact only for the producing tokenizer.
+    # ``skip_special_tokens=False`` is load-bearing: the default drops special
+    # tokens, so ANY chat-templated calibration (<|im_start|>, <|im_end|>,
+    # <tool_call>, ...) re-encodes to different ids and the test reports a
+    # foreign vocabulary.  Measured on Coder390 agent traces: 0.28 default vs
+    # 1.0000 with special tokens kept.
     match = []
     for row in ids:
         row = [int(x) for x in row if 0 <= int(x) < vocab]
-        dec = tk.decode(row)
+        dec = tk.decode(row, skip_special_tokens=False)
         re = tk.encode(dec).ids
         n = min(len(row), len(re))
         if n:

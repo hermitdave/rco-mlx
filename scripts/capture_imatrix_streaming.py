@@ -659,12 +659,19 @@ def capture(profile: CaptureProfile, src: Path, args) -> int:
             ces.append(float(-picked.mean()))
             lps.append(lp.astype(mx.float16))
         mx.eval(*lps)
-        np.savez(args.dump_logprobs,
-                 rows=np.asarray(ids).astype(np.int32),
-                 logprobs=np.stack([np.asarray(x) for x in lps]),
+        rows_np = np.asarray(ids).astype(np.int32)
+        lps_np = np.stack([np.asarray(x) for x in lps])
+        np.savez(args.dump_logprobs, rows=rows_np, logprobs=lps_np,
                  ce=np.array(ces))
+        # Plain .npy siblings: np.load(mmap_mode='r') on an npz MATERIALISES the
+        # whole member (measured: 6 GB RSS for a 6-row dump), which is fatal at
+        # V=248,320. A .npy is genuinely lazy, so eval_kl_masked.py can read one
+        # row (~1 GB) at a time.
+        np.save(str(args.dump_logprobs) + ".rows.npy", rows_np)
+        np.save(str(args.dump_logprobs) + ".logprobs.npy", lps_np)
         print(f"[logprobs] -> {args.dump_logprobs} "
-              f"({len(lps)} rows x {lps[0].shape[0]} positions)", flush=True)
+              f"({len(lps)} rows x {lps[0].shape[0]} positions) "
+              f"+ .rows.npy/.logprobs.npy", flush=True)
 
     print(f"[done] {len(in_sum2)} imatrix tensors", flush=True)
     cov = expert_coverage_stats(

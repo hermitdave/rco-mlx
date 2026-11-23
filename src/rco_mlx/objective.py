@@ -88,6 +88,11 @@ class LossTable:
     bitwidths: np.ndarray
     group_size: int = 64
     transform: str = "neg"
+    #: Bits of side-channel state per group. 16 for symmetric (one bf16 scale),
+    #: 32 for affine (scale + bias). ``effective_bits`` defaulted to 16 for both,
+    #: so every affine build under-charged the budget by 0.25 bpw at gs64 and the
+    #: emitted file came out larger than the reported target.
+    scale_bits: int = 16
 
     def __post_init__(self) -> None:
         self.losses = np.asarray(self.losses, dtype=np.float64)
@@ -124,13 +129,28 @@ class LossTable:
     def actual_bits(self) -> np.ndarray:
         """Effective bits per weight per option, including scale overhead."""
         return np.array(
-            [effective_bits(int(b), self.group_size) for b in self.bitwidths],
+            [effective_bits(int(b), self.group_size, self.scale_bits) for b in self.bitwidths],
             dtype=np.float64,
         )
 
     def values(self) -> np.ndarray:
-        """Value table (higher is better) for ``budget_dp``."""
-        return values_from_losses(self.losses, self.transform)
+        """Value table (higher is better) for ``budget_dp``.
+
+        Parameter-weighted: ``budget_dp`` accumulates a plain sum over groups, so
+        each group's value must carry its own parameter fraction for the
+        objective to be the param-weighted error that the bit budget is
+        denominated in (``costs = fracs x bits``).
+
+        Without the weighting the DP minimises an UNWEIGHTED mean over tensors
+        while spending a parameter-weighted budget, so small tensors get the
+        same vote as 1.3 B-parameter ones. Measured on Qwen3.8-27B Coder390 at
+        4.5 bpw: the unweighted optimum is 31.8% worse on the param-weighted
+        reconstruction error at the same budget, and loses to a near-uniform
+        4/5-bit allocation. ``budget_dp``'s own docstring already promises that
+        ``fracs`` weight the objective as well as the cost; this makes the code
+        match it.
+        """
+        return self.fracs[:, None] * values_from_losses(self.losses, self.transform)
 
     def solve(self, target_avg_bits: float, resolution: int = 10000) -> np.ndarray:
         """Run the knapsack DP and return the chosen option index per group."""

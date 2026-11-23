@@ -212,12 +212,18 @@ def run_rco_allocation(
     group_is_embedding: list[bool] | None = None,
     embedding_min_bits: int = 2,
     expert_bits: list[int] | None = None,
+    quant_mode: str = "affine",
 ) -> tuple[dict[str, int], dict]:
+    # affine stores a scale AND a bias per group; symmetric stores one scale.
+    # Charging only 16 bits/group under-counts affine cost by 0.25 bpw at gs64,
+    # so the DP overspends and the artifact exceeds its reported target.
+    scale_bits = 32 if quant_mode == "affine" else 16
     table = LossTable(
         losses=losses,
         fracs=fracs,
         bitwidths=bitwidths,
         group_size=group_size,
+        scale_bits=scale_bits,
     )
     values = table.values()
     if expert_min_bits > int(bitwidths.min()):
@@ -1811,6 +1817,7 @@ def main():
                     [int(b) for b in args.expert_bits.split(",")]
                     if args.expert_bits else None
                 ),
+                quant_mode=args.quant_mode,
             )
             assignment = {
                 group_names[i]: c_assignment[c_names[j]]
@@ -1832,6 +1839,7 @@ def main():
                     [int(b) for b in args.expert_bits.split(",")]
                     if args.expert_bits else None
                 ),
+                quant_mode=args.quant_mode,
             )
         print(f"  achieved {report['achieved_bpw']:.4f} bpw")
         print(f"  histogram: {report['bit_histogram']}")
