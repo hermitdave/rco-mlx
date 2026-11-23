@@ -13,6 +13,7 @@ know which model it is running on.
 """
 
 from .base import ModelAdapter, get, register
+from .bailing_moe_v3 import BailingMoeV3Adapter
 from .default import DefaultAdapter
 from .granitemoehybrid import GraniteMoeHybridAdapter
 from .flint import FlintAdapter
@@ -26,6 +27,7 @@ from .qwen4_exp import Qwen4ExpAdapter
 
 __all__ = [
     "ModelAdapter",
+    "BailingMoeV3Adapter",
     "DefaultAdapter",
     "GraniteMoeHybridAdapter",
     "Inkling2LoopAdapter",

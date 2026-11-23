@@ -933,6 +933,13 @@ def stream_quantize(
         if model_adapter is not None and hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
             return True, (ngram_bits or model_adapter.ngram_quant_bits), (ngram_group_size or model_adapter.ngram_group_size), 1.0
         if (
+            model_adapter is not None
+            and hasattr(model_adapter, "is_mtp_key")
+            and model_adapter.is_mtp_key(mlx_key)
+            and not quant_mtp
+        ):
+            return False, 4, gs, 1.0
+        if (
             "norm" in mlx_key
             or (not quant_embed and ("embed" in mlx_key or "lm_head" in mlx_key))
             or (not quant_mtp and "mtp" in mlx_key)
@@ -1254,7 +1261,7 @@ def _rewrite_config_mlx_keys(output_dir: Path, model_adapter, quant_mode: str = 
 # ---------------------------------------------------------------------------
 
 _MOE_ADAPTERS = {"olmoe", "qwen3_5_moe", "qwen4_exp", "lfm2_moe", "granitemoehybrid",
-                 "inkling2_loop"}
+                 "inkling2_loop", "bailing_moe_v3"}
 
 
 def detect_moe_model(source_dir: Path, model_type: str | None) -> bool:
@@ -1482,6 +1489,12 @@ def main():
                          "the head 8-bit because it is small). The MTP group size "
                          "is reset to --group-size so a low width is not paired "
                          "with a coarse gs128")
+    ap.add_argument("--emit-model-file", action="store_true",
+                    help="Copy the adapter's bundled model_file into the output "
+                         "checkpoint and set config.json['model_file'], so the "
+                         "artifact loads with trust_remote_code=True. Use when "
+                         "the architecture needs code the stock loader lacks "
+                         "(e.g. Ling's trained SwiGLU clamp)")
     ap.add_argument("--uniform-bits", type=int, default=None,
                     help="Force one bitwidth on every RCO-managed module, "
                          "discarding the DP assignment. Reaches the model's "
@@ -1590,6 +1603,12 @@ def main():
     if args.quantize_mtp:
         model_adapter.quantize_mtp = True
         print("MTP head quantization: enabled (default bitwidth)")
+
+    # Let adapters resolve source-derived state.  Ling names its MTP head by
+    # layer index (`model.layers.<num_hidden_layers>`) rather than an `mtp.`
+    # prefix, so the trunk/MTP boundary has to be read from config.
+    if model_adapter is not None and hasattr(model_adapter, "bind_source"):
+        model_adapter.bind_source(source)
 
     quantize_embeddings = bool(getattr(model_adapter, "quantize_embeddings", False))
 
@@ -2191,6 +2210,34 @@ def main():
         cfg_path.write_text(json.dumps(cfg_data, indent=2))
         print(f"  config rewritten ({len(qc)} -> {len(final_qc)} entries)")
 
+    # Post-process: Ling / Bailing expert stacking.
+    # HF stores routed experts per expert; MLX SwitchGLU wants one stacked
+    # tensor per (layer, projection).  Config entries must be rewritten to the
+    # stacked names too, or the loader falls back to its default bitwidth.
+    if args.model_type == "bailing_moe_v3":
+        print("[post] stacking Bailing per-expert tensors into switch_mlp ...")
+        import re as _re_bailing
+
+        cfg_data = json.loads((output / "config.json").read_text())
+        num_layers = int(cfg_data["num_hidden_layers"])
+        num_experts = int(cfg_data["num_experts"])
+        dense = list(range(int(cfg_data.get("first_k_dense_replace", 0))))
+        from rco_mlx.expert_stacking import stack_bailing_experts
+
+        n_stacked = stack_bailing_experts(output, num_layers, num_experts, dense)
+        print(f"  stacked {n_stacked} groups")
+
+        final_qc = {}
+        for k, v in cfg_data.get("quantization", {}).items():
+            nk = _re_bailing.sub(r"\.experts\.\d+\.", ".switch_mlp.", k)
+            if nk in final_qc and final_qc[nk] != v:
+                print(f"  warning: conflicting quantization spec for {nk}")
+            final_qc[nk] = v
+        cfg_data["quantization"] = final_qc
+        cfg_data["quantization_config"] = final_qc
+        (output / "config.json").write_text(json.dumps(cfg_data, indent=2))
+        print(f"  config rewritten ({len(final_qc)} entries)")
+
     # Post-process: Nemotron-H Puzzle / Bolt expert stacking.
     # HF stores the routed experts individually (experts.E.{up,down}_proj);
     # MLX SwitchLinear wants one stacked tensor per projection, named
@@ -2370,6 +2417,24 @@ def main():
 
     print(f"Config: {output / 'config.json'}")
     print(f"{'='*60}")
+
+    # Ship a model_file when the architecture needs code stock mlx-lm lacks
+    # (Ling's trained SwiGLU clamp). Done last: the post-process blocks rewrite
+    # config.json, and this must win.
+    if args.emit_model_file:
+        mf_name = getattr(model_adapter, "model_file_name", None)
+        if not mf_name:
+            sys.exit(f"--emit-model-file: adapter {args.model_type!r} bundles no model_file")
+        mf_src = Path(__file__).parent.parent / "src" / "rco_mlx" / "assets" / mf_name
+        if not mf_src.exists():
+            sys.exit(f"--emit-model-file: bundled asset missing: {mf_src}")
+        shutil.copy2(mf_src, output / mf_name)
+        mf_cfg_path = output / "config.json"
+        mf_cfg = json.loads(mf_cfg_path.read_text())
+        mf_cfg["model_file"] = mf_name
+        mf_cfg_path.write_text(json.dumps(mf_cfg, indent=2))
+        print(f"[post] shipped model_file {mf_name} "
+              "(load with trust_remote_code=True)")
 
     # The quantizer writes model.safetensors.index.json while streaming, but
     # the post-process steps above (Qwen3.5 sanitize, LFM2/Nemotron expert

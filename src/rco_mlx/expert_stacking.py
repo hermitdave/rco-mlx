@@ -110,6 +110,105 @@ def stack_flint_experts(path, num_layers, num_experts, dense_layers=()):
     return n_stacked
 
 
+def stack_bailing_experts(path, num_layers, num_experts, dense_layers=()):
+    """Stack Ling/Bailing per-expert routed tensors into ``switch_mlp``.
+
+    Ling stores routed experts as ``model.layers.<L>.mlp.experts.<E>.<proj>.<suffix>``
+    and MLX's ``SwitchGLU`` wants one stacked tensor per (layer, projection)
+    named ``model.layers.<L>.mlp.switch_mlp.<proj>.<suffix>``.  Same layout as
+    Flint, so the same regexes apply; the dense layers (``first_k_dense_replace``
+    of them) carry a plain MLP instead and are skipped.
+
+    Memory is bounded by one shard: group membership is resolved from the
+    shard *headers*, then each file is loaded, stacked and rewritten once.
+    Unlike the Flint path this refuses to guess when a group is incomplete --
+    a silently skipped group loads as ``Received N parameters not in model``.
+    """
+    import glob
+    import json
+    import os
+    import struct
+
+    import safetensors.torch as st
+    import torch
+
+    shards = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+    if not shards:
+        sys.exit(f"no safetensors shards in {path}")
+
+    def _header_keys(shard):
+        with open(shard, "rb") as fh:
+            header_len = struct.unpack("<Q", fh.read(8))[0]
+            header = json.loads(fh.read(header_len))
+        return {k for k in header if k != "__metadata__"}
+
+    keys_per_shard = [_header_keys(s) for s in shards]
+    shard_of = {}
+    for i, keys in enumerate(keys_per_shard):
+        for k in keys:
+            shard_of[k] = i
+
+    per_expert, stacked = {}, set()
+    for k in shard_of:
+        m = _EXPERT_RE.match(k)
+        if m:
+            per_expert.setdefault(
+                (int(m.group(1)), m.group(3), m.group(4)), {}
+            )[int(m.group(2))] = k
+            continue
+        m = _STACKED_RE.match(k)
+        if m:
+            stacked.add((int(m.group(1)), m.group(2), m.group(3)))
+
+    dense = set(dense_layers)
+
+    # Validate before writing anything.
+    for (layer, proj, suf), members in sorted(per_expert.items()):
+        if layer in dense or (layer, proj, suf) in stacked:
+            continue
+        key = f"model.layers.{layer}.mlp.switch_mlp.{proj}.{suf}"
+        if len(members) != num_experts:
+            sys.exit(
+                f"cannot stack {key}: {len(members)}/{num_experts} experts "
+                "present -- checkpoint is incomplete"
+            )
+        owners = {shard_of[members[e]] for e in range(num_experts)}
+        if len(owners) != 1:
+            sys.exit(
+                f"cannot stack {key}: its experts span shards {sorted(owners)}; "
+                "a stacked tensor cannot cross files"
+            )
+
+    n_stacked = 0
+    for i, shard in enumerate(shards):
+        tensors = st.load_file(shard)
+        new = dict(tensors)
+        touched = 0
+        for (layer, proj, suf), members in per_expert.items():
+            if layer in dense or (layer, proj, suf) in stacked:
+                continue
+            if shard_of[members[0]] != i:
+                continue
+            vals = [new.pop(members[e]) for e in range(num_experts)]
+            new[f"model.layers.{layer}.mlp.switch_mlp.{proj}.{suf}"] = (
+                torch.stack(vals, dim=0).contiguous()
+            )
+            touched += 1
+        # Leftovers of groups that were already stacked, or that belong to a
+        # dense layer (plain MLP, not routed experts).
+        for (layer, proj, suf), members in per_expert.items():
+            if layer in dense or (layer, proj, suf) in stacked:
+                for k in members.values():
+                    new.pop(k, None)
+        if touched:
+            tmp = shard + ".tmp"
+            st.save_file(new, tmp)
+            os.replace(tmp, shard)
+            print(f"  {os.path.basename(shard)}: stacked {touched} groups")
+        n_stacked += touched
+    return n_stacked
+
+
 def main():
     import argparse
 
