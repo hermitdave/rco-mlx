@@ -490,6 +490,7 @@ def emit_and_validate(
     group_size_map: dict[str, int] | None = None,
     quantize_embeddings: bool = False,
     quantize_mtp: bool = False,
+    is_mtp=None,
 ) -> MlxQuantConfig:
     filtered = assignment
     if bf16_prefixes:
@@ -498,7 +499,8 @@ def emit_and_validate(
     quant_assignment = {
         k: v for k, v in filtered.items()
         if _is_quantizable(
-            k, quantize_embeddings=quantize_embeddings, quantize_mtp=quantize_mtp
+            k, quantize_embeddings=quantize_embeddings, quantize_mtp=quantize_mtp,
+            is_mtp=is_mtp,
         )
     }
     cfg = allocation_to_config(
@@ -543,15 +545,35 @@ def emit_and_validate(
     return cfg
 
 
+def _embedding_key_fn(model_adapter):
+    """Token-embedding / lm_head predicate across naming conventions."""
+    def _is_embedding(key: str) -> bool:
+        return key.split(".")[-1] in ("embed_tokens", "word_embeddings", "lm_head")
+    return _is_embedding
+
+
+def _mtp_key_fn(model_adapter):
+    """MTP predicate: the adapter's hook when it has one, else the name test.
+
+    Ling names its MTP head by layer index (``model.layers.<num_hidden_layers>``)
+    with no ``mtp`` marker, so every ``"mtp" in key`` check silently misses it.
+    """
+    if model_adapter is not None and hasattr(model_adapter, "is_mtp_key"):
+        return model_adapter.is_mtp_key
+    return lambda k: "mtp" in k
+
+
 def _is_quantizable(
     path: str,
     quantize_embeddings: bool = False,
     quantize_mtp: bool = False,
+    is_mtp=None,
 ) -> bool:
     check = path if path.endswith(".weight") else path + ".weight"
     if "norm" in check:
         return False
-    if not quantize_mtp and "mtp" in check:
+    mtp_hit = is_mtp(path) if is_mtp is not None else ("mtp" in check)
+    if not quantize_mtp and mtp_hit:
         return False
     if not quantize_embeddings and ("embed" in check or "lm_head" in check):
         return False
@@ -1475,9 +1497,15 @@ def main():
                          "against checkpoints that quantize embeddings (e.g. "
                          "MACaQ) at matched file size.")
     ap.add_argument("--embedding-min-bits", type=int, default=2,
-                    help="Minimum bitwidth for embedding groups when "
-                         "--quantize-embeddings is set (default 2 = no floor; "
+                    help="With --quantize-embeddings, floor the DP's bitwidth "
+                         "for embed_tokens/lm_head (default 2 = no floor; "
                          "4 is safer for tied output projections).")
+    ap.add_argument("--embedding-bits", type=int, default=None,
+                    help="With --quantize-embeddings, force ONE bitwidth for "
+                         "embed_tokens and lm_head instead of the DP's choice. "
+                         "Needed because the error-DB builder skips lm_head, so "
+                         "it never becomes an allocation group and would "
+                         "otherwise fall back to the 4-bit default.")
     ap.add_argument("--quantize-mtp", action="store_true",
                     help="Quantize the MTP (multi-token prediction) head weights "
                          "at the default bitwidth instead of keeping them BF16. "
@@ -1864,12 +1892,29 @@ def main():
         print(f"  histogram: {report['bit_histogram']}")
 
         if args.quantize_mtp and args.mtp_bits:
-            n_over = sum(1 for k in assignment if "mtp" in k)
-            for k in assignment:
-                if "mtp" in k:
-                    assignment[k] = int(args.mtp_bits)
+            _is_mtp = _mtp_key_fn(model_adapter)
+            mtp_keys = [k for k in assignment if _is_mtp(k)]
+            n_over = len(mtp_keys)
+            for k in mtp_keys:
+                assignment[k] = int(args.mtp_bits)
             if n_over:
                 print(f"  MTP override: {n_over} tensors -> {args.mtp_bits}-bit")
+
+        if args.quantize_embeddings and args.embedding_bits:
+            _is_emb = _embedding_key_fn(model_adapter)
+            n_over = 0
+            for k in [k for k in assignment if _is_emb(k)]:
+                assignment[k] = int(args.embedding_bits)
+                n_over += 1
+            # The error-DB builder skips lm_head, so it may never become an
+            # allocation group and should_quantize would fall back to 4-bit.
+            for k in ("model.word_embeddings", "lm_head"):
+                if _is_emb(k) and k not in assignment:
+                    assignment[k] = int(args.embedding_bits)
+                    n_over += 1
+            if n_over:
+                print(f"  embedding override: {n_over} tensors "
+                      f"-> {args.embedding_bits}-bit")
 
         if args.uniform_bits:
             # Force one width on every RCO-managed module. This is the only way
@@ -1980,7 +2025,8 @@ def main():
 
     if args.quantize_mtp and args.mtp_bits:
         # A forced low width must not inherit the DP's coarse gs128.
-        for k in [k for k in group_size_map if "mtp" in k]:
+        _is_mtp = _mtp_key_fn(model_adapter)
+        for k in [k for k in group_size_map if _is_mtp(k)]:
             del group_size_map[k]
 
     clip_map: dict[str, float] = {}
@@ -1996,6 +2042,7 @@ def main():
         group_size_map=group_size_map or None,
         quantize_embeddings=quantize_embeddings,
         quantize_mtp=bool(getattr(model_adapter, "quantize_mtp", False)),
+        is_mtp=_mtp_key_fn(model_adapter),
     )
 
     # --- Step 5: quantize ---

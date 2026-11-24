@@ -97,6 +97,11 @@ class BailingMoeV3Adapter(ModelAdapter):
     # config.json; stock mlx-lm drops them.  The bundled model_file binds them.
     model_file_name = "bailing_hybrid.py"
 
+    # Set by the pipeline under --quantize-embeddings.  main() refuses that flag
+    # unless the adapter declares the attribute, so it must exist even though
+    # the default keeps embeddings/lm_head BF16.
+    quantize_embeddings = False
+
     # Tensors that must never be quantized.  The pipeline wraps these as
     # ``.<prefix>.``, so ``mlp.gate`` hits the router while ``mlp.gate_proj``
     # (dense layers) is untouched.
