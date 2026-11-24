@@ -119,6 +119,12 @@ class ModelAdapter(ABC):
     # agree and no sanitize is needed.
     rename_bf16_keys = False
 
+    # When set, ``--emit-model-file`` copies this bundled file into the output
+    # checkpoint and points ``config.json["model_file"]`` at it, so the
+    # artifact needs ``trust_remote_code=True`` to load.  Name relative to
+    # ``rco_mlx/assets/``.
+    model_file_name: Optional[str] = None
+
     def build_layer_groups(self, layers: List[Dict]) -> List[Dict]:
         """Group layers for RCO allocation. Default: one group per layer."""
         return [

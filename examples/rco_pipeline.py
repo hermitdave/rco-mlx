@@ -490,6 +490,7 @@ def emit_and_validate(
     group_size_map: dict[str, int] | None = None,
     quantize_embeddings: bool = False,
     quantize_mtp: bool = False,
+    is_mtp=None,
 ) -> MlxQuantConfig:
     filtered = assignment
     if bf16_prefixes:
@@ -498,7 +499,8 @@ def emit_and_validate(
     quant_assignment = {
         k: v for k, v in filtered.items()
         if _is_quantizable(
-            k, quantize_embeddings=quantize_embeddings, quantize_mtp=quantize_mtp
+            k, quantize_embeddings=quantize_embeddings, quantize_mtp=quantize_mtp,
+            is_mtp=is_mtp,
         )
     }
     cfg = allocation_to_config(
@@ -543,15 +545,35 @@ def emit_and_validate(
     return cfg
 
 
+def _embedding_key_fn(model_adapter):
+    """Token-embedding / lm_head predicate across naming conventions."""
+    def _is_embedding(key: str) -> bool:
+        return key.split(".")[-1] in ("embed_tokens", "word_embeddings", "lm_head")
+    return _is_embedding
+
+
+def _mtp_key_fn(model_adapter):
+    """MTP predicate: the adapter's hook when it has one, else the name test.
+
+    Ling names its MTP head by layer index (``model.layers.<num_hidden_layers>``)
+    with no ``mtp`` marker, so every ``"mtp" in key`` check silently misses it.
+    """
+    if model_adapter is not None and hasattr(model_adapter, "is_mtp_key"):
+        return model_adapter.is_mtp_key
+    return lambda k: "mtp" in k
+
+
 def _is_quantizable(
     path: str,
     quantize_embeddings: bool = False,
     quantize_mtp: bool = False,
+    is_mtp=None,
 ) -> bool:
     check = path if path.endswith(".weight") else path + ".weight"
     if "norm" in check:
         return False
-    if not quantize_mtp and "mtp" in check:
+    mtp_hit = is_mtp(path) if is_mtp is not None else ("mtp" in check)
+    if not quantize_mtp and mtp_hit:
         return False
     if not quantize_embeddings and ("embed" in check or "lm_head" in check):
         return False
@@ -933,6 +955,13 @@ def stream_quantize(
         if model_adapter is not None and hasattr(model_adapter, "is_ngram_key") and model_adapter.is_ngram_key(mlx_key):
             return True, (ngram_bits or model_adapter.ngram_quant_bits), (ngram_group_size or model_adapter.ngram_group_size), 1.0
         if (
+            model_adapter is not None
+            and hasattr(model_adapter, "is_mtp_key")
+            and model_adapter.is_mtp_key(mlx_key)
+            and not quant_mtp
+        ):
+            return False, 4, gs, 1.0
+        if (
             "norm" in mlx_key
             or (not quant_embed and ("embed" in mlx_key or "lm_head" in mlx_key))
             or (not quant_mtp and "mtp" in mlx_key)
@@ -1254,7 +1283,7 @@ def _rewrite_config_mlx_keys(output_dir: Path, model_adapter, quant_mode: str = 
 # ---------------------------------------------------------------------------
 
 _MOE_ADAPTERS = {"olmoe", "qwen3_5_moe", "qwen4_exp", "lfm2_moe", "granitemoehybrid",
-                 "inkling2_loop"}
+                 "inkling2_loop", "bailing_moe_v3"}
 
 
 def detect_moe_model(source_dir: Path, model_type: str | None) -> bool:
@@ -1387,15 +1416,35 @@ def param_weighted_bpw(assignment: dict[str, int], param_counts: dict[str, int])
     An unweighted mean over groups is misleading: a group with a few hundred
     parameters counts exactly as much as one with tens of millions, so it can
     read far above (or below) what the checkpoint actually costs on disk.
+
+    Groups are also *aggregates*: an MoE expert group is represented by one
+    key (``...experts.0.gate_proj``) while ``param_counts`` carries every
+    member. Weighting only the representative silently drops 511/512 of the
+    mass and reads far too high -- measured 6.36 bpw where the checkpoint is
+    really 2.75 bpw. Summing members into the aggregate key first fixes it.
     """
+    def _norm(name: str) -> str:
+        return name[:-len(".weight")] if name.endswith(".weight") else name
+
+    import re as _re_pw
+
+    aggregated: dict[str, int] = {}
+    for name, pc in param_counts.items():
+        key = _norm(name)
+        m = _re_pw.match(r"^(.*\.experts)\.\d+\.(.+)$", key)
+        if m:
+            key = f"{m.group(1)}.{m.group(2)}"
+        aggregated[key] = aggregated.get(key, 0) + pc
+
     total = 0
     weighted = 0.0
     for name, bits in assignment.items():
-        pc = (
-            param_counts.get(name, 0)
-            or param_counts.get(name + ".weight", 0)
-            or param_counts.get(name.removesuffix(".weight"), 0)
-        )
+        key = _norm(name)
+        pc = aggregated.get(key)
+        if pc is None:
+            m = _re_pw.match(r"^(.*\.experts)\.\d+\.(.+)$", key)
+            if m:
+                pc = aggregated.get(f"{m.group(1)}.{m.group(2)}")
         if not pc:
             continue
         total += pc
@@ -1468,9 +1517,15 @@ def main():
                          "against checkpoints that quantize embeddings (e.g. "
                          "MACaQ) at matched file size.")
     ap.add_argument("--embedding-min-bits", type=int, default=2,
-                    help="Minimum bitwidth for embedding groups when "
-                         "--quantize-embeddings is set (default 2 = no floor; "
+                    help="With --quantize-embeddings, floor the DP's bitwidth "
+                         "for embed_tokens/lm_head (default 2 = no floor; "
                          "4 is safer for tied output projections).")
+    ap.add_argument("--embedding-bits", type=int, default=None,
+                    help="With --quantize-embeddings, force ONE bitwidth for "
+                         "embed_tokens and lm_head instead of the DP's choice. "
+                         "Needed because the error-DB builder skips lm_head, so "
+                         "it never becomes an allocation group and would "
+                         "otherwise fall back to the 4-bit default.")
     ap.add_argument("--quantize-mtp", action="store_true",
                     help="Quantize the MTP (multi-token prediction) head weights "
                          "at the default bitwidth instead of keeping them BF16. "
@@ -1482,6 +1537,12 @@ def main():
                          "the head 8-bit because it is small). The MTP group size "
                          "is reset to --group-size so a low width is not paired "
                          "with a coarse gs128")
+    ap.add_argument("--emit-model-file", action="store_true",
+                    help="Copy the adapter's bundled model_file into the output "
+                         "checkpoint and set config.json['model_file'], so the "
+                         "artifact loads with trust_remote_code=True. Use when "
+                         "the architecture needs code the stock loader lacks "
+                         "(e.g. Ling's trained SwiGLU clamp)")
     ap.add_argument("--uniform-bits", type=int, default=None,
                     help="Force one bitwidth on every RCO-managed module, "
                          "discarding the DP assignment. Reaches the model's "
@@ -1590,6 +1651,12 @@ def main():
     if args.quantize_mtp:
         model_adapter.quantize_mtp = True
         print("MTP head quantization: enabled (default bitwidth)")
+
+    # Let adapters resolve source-derived state.  Ling names its MTP head by
+    # layer index (`model.layers.<num_hidden_layers>`) rather than an `mtp.`
+    # prefix, so the trunk/MTP boundary has to be read from config.
+    if model_adapter is not None and hasattr(model_adapter, "bind_source"):
+        model_adapter.bind_source(source)
 
     quantize_embeddings = bool(getattr(model_adapter, "quantize_embeddings", False))
 
@@ -1845,12 +1912,29 @@ def main():
         print(f"  histogram: {report['bit_histogram']}")
 
         if args.quantize_mtp and args.mtp_bits:
-            n_over = sum(1 for k in assignment if "mtp" in k)
-            for k in assignment:
-                if "mtp" in k:
-                    assignment[k] = int(args.mtp_bits)
+            _is_mtp = _mtp_key_fn(model_adapter)
+            mtp_keys = [k for k in assignment if _is_mtp(k)]
+            n_over = len(mtp_keys)
+            for k in mtp_keys:
+                assignment[k] = int(args.mtp_bits)
             if n_over:
                 print(f"  MTP override: {n_over} tensors -> {args.mtp_bits}-bit")
+
+        if args.quantize_embeddings and args.embedding_bits:
+            _is_emb = _embedding_key_fn(model_adapter)
+            n_over = 0
+            for k in [k for k in assignment if _is_emb(k)]:
+                assignment[k] = int(args.embedding_bits)
+                n_over += 1
+            # The error-DB builder skips lm_head, so it may never become an
+            # allocation group and should_quantize would fall back to 4-bit.
+            for k in ("model.word_embeddings", "lm_head"):
+                if _is_emb(k) and k not in assignment:
+                    assignment[k] = int(args.embedding_bits)
+                    n_over += 1
+            if n_over:
+                print(f"  embedding override: {n_over} tensors "
+                      f"-> {args.embedding_bits}-bit")
 
         if args.uniform_bits:
             # Force one width on every RCO-managed module. This is the only way
@@ -1961,7 +2045,8 @@ def main():
 
     if args.quantize_mtp and args.mtp_bits:
         # A forced low width must not inherit the DP's coarse gs128.
-        for k in [k for k in group_size_map if "mtp" in k]:
+        _is_mtp = _mtp_key_fn(model_adapter)
+        for k in [k for k in group_size_map if _is_mtp(k)]:
             del group_size_map[k]
 
     clip_map: dict[str, float] = {}
@@ -1977,6 +2062,7 @@ def main():
         group_size_map=group_size_map or None,
         quantize_embeddings=quantize_embeddings,
         quantize_mtp=bool(getattr(model_adapter, "quantize_mtp", False)),
+        is_mtp=_mtp_key_fn(model_adapter),
     )
 
     # --- Step 5: quantize ---
@@ -2191,6 +2277,34 @@ def main():
         cfg_path.write_text(json.dumps(cfg_data, indent=2))
         print(f"  config rewritten ({len(qc)} -> {len(final_qc)} entries)")
 
+    # Post-process: Ling / Bailing expert stacking.
+    # HF stores routed experts per expert; MLX SwitchGLU wants one stacked
+    # tensor per (layer, projection).  Config entries must be rewritten to the
+    # stacked names too, or the loader falls back to its default bitwidth.
+    if args.model_type == "bailing_moe_v3":
+        print("[post] stacking Bailing per-expert tensors into switch_mlp ...")
+        import re as _re_bailing
+
+        cfg_data = json.loads((output / "config.json").read_text())
+        num_layers = int(cfg_data["num_hidden_layers"])
+        num_experts = int(cfg_data["num_experts"])
+        dense = list(range(int(cfg_data.get("first_k_dense_replace", 0))))
+        from rco_mlx.expert_stacking import stack_bailing_experts
+
+        n_stacked = stack_bailing_experts(output, num_layers, num_experts, dense)
+        print(f"  stacked {n_stacked} groups")
+
+        final_qc = {}
+        for k, v in cfg_data.get("quantization", {}).items():
+            nk = _re_bailing.sub(r"\.experts\.\d+\.", ".switch_mlp.", k)
+            if nk in final_qc and final_qc[nk] != v:
+                print(f"  warning: conflicting quantization spec for {nk}")
+            final_qc[nk] = v
+        cfg_data["quantization"] = final_qc
+        cfg_data["quantization_config"] = final_qc
+        (output / "config.json").write_text(json.dumps(cfg_data, indent=2))
+        print(f"  config rewritten ({len(final_qc)} entries)")
+
     # Post-process: Nemotron-H Puzzle / Bolt expert stacking.
     # HF stores the routed experts individually (experts.E.{up,down}_proj);
     # MLX SwitchLinear wants one stacked tensor per projection, named
@@ -2370,6 +2484,24 @@ def main():
 
     print(f"Config: {output / 'config.json'}")
     print(f"{'='*60}")
+
+    # Ship a model_file when the architecture needs code stock mlx-lm lacks
+    # (Ling's trained SwiGLU clamp). Done last: the post-process blocks rewrite
+    # config.json, and this must win.
+    if args.emit_model_file:
+        mf_name = getattr(model_adapter, "model_file_name", None)
+        if not mf_name:
+            sys.exit(f"--emit-model-file: adapter {args.model_type!r} bundles no model_file")
+        mf_src = Path(__file__).parent.parent / "src" / "rco_mlx" / "assets" / mf_name
+        if not mf_src.exists():
+            sys.exit(f"--emit-model-file: bundled asset missing: {mf_src}")
+        shutil.copy2(mf_src, output / mf_name)
+        mf_cfg_path = output / "config.json"
+        mf_cfg = json.loads(mf_cfg_path.read_text())
+        mf_cfg["model_file"] = mf_name
+        mf_cfg_path.write_text(json.dumps(mf_cfg, indent=2))
+        print(f"[post] shipped model_file {mf_name} "
+              "(load with trust_remote_code=True)")
 
     # The quantizer writes model.safetensors.index.json while streaming, but
     # the post-process steps above (Qwen3.5 sanitize, LFM2/Nemotron expert
