@@ -174,10 +174,16 @@ def stack_bailing_experts(path, num_layers, num_experts, dense_layers=()):
             )
         owners = {shard_of[members[e]] for e in range(num_experts)}
         if len(owners) != 1:
-            sys.exit(
-                f"cannot stack {key}: its experts span shards {sorted(owners)}; "
-                "a stacked tensor cannot cross files"
+            # Ling shards a layer's routed experts ACROSS files (measured:
+            # layer 3's down_proj weights split 374 + 138 between shards 1 and
+            # 2), so no single shard ever holds a complete group. Nothing has
+            # been written yet at this point, so hand the whole job to the
+            # merge-everything stacker -- the same fallback Flint needs.
+            print(
+                f"  {key}: experts span shards {sorted(owners)}; "
+                "falling back to cross-shard merge"
             )
+            return stack_flint_experts(path, num_layers, num_experts, dense_layers)
 
     n_stacked = 0
     for i, shard in enumerate(shards):

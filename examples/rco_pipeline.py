@@ -1416,15 +1416,35 @@ def param_weighted_bpw(assignment: dict[str, int], param_counts: dict[str, int])
     An unweighted mean over groups is misleading: a group with a few hundred
     parameters counts exactly as much as one with tens of millions, so it can
     read far above (or below) what the checkpoint actually costs on disk.
+
+    Groups are also *aggregates*: an MoE expert group is represented by one
+    key (``...experts.0.gate_proj``) while ``param_counts`` carries every
+    member. Weighting only the representative silently drops 511/512 of the
+    mass and reads far too high -- measured 6.36 bpw where the checkpoint is
+    really 2.75 bpw. Summing members into the aggregate key first fixes it.
     """
+    def _norm(name: str) -> str:
+        return name[:-len(".weight")] if name.endswith(".weight") else name
+
+    import re as _re_pw
+
+    aggregated: dict[str, int] = {}
+    for name, pc in param_counts.items():
+        key = _norm(name)
+        m = _re_pw.match(r"^(.*\.experts)\.\d+\.(.+)$", key)
+        if m:
+            key = f"{m.group(1)}.{m.group(2)}"
+        aggregated[key] = aggregated.get(key, 0) + pc
+
     total = 0
     weighted = 0.0
     for name, bits in assignment.items():
-        pc = (
-            param_counts.get(name, 0)
-            or param_counts.get(name + ".weight", 0)
-            or param_counts.get(name.removesuffix(".weight"), 0)
-        )
+        key = _norm(name)
+        pc = aggregated.get(key)
+        if pc is None:
+            m = _re_pw.match(r"^(.*\.experts)\.\d+\.(.+)$", key)
+            if m:
+                pc = aggregated.get(f"{m.group(1)}.{m.group(2)}")
         if not pc:
             continue
         total += pc
