@@ -72,6 +72,16 @@ def main() -> int:
         fails.append(f"{len(mismatched)} weight_map keys missing from their shard")
     if orphans:
         fails.append(f"{len(orphans)} on-disk tensors absent from the index")
+    # Shard files nobody references: the stacking post-process can leave an
+    # empty header-only file behind (measured on Ling-3.2-air, shard 13 held 0
+    # tensors and 4 KB). Harmless at load time but dead weight in an upload.
+    # Must be measured by listing the directory -- an empty shard has no
+    # entries in the index or in `headers`, so neither can reveal it.
+    disk_files = {p.name for p in d.glob("*.safetensors")}
+    unused = sorted(disk_files - set(idx.values()))
+    if unused:
+        fails.append(f"{len(unused)} shard file(s) are unreferenced by the index: "
+                     f"{unused[:4]}")
 
     # 2. forbidden tensors
     forbidden = [k for k in headers
