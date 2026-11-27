@@ -71,6 +71,11 @@ class Inkling2LoopAdapter(ModelAdapter):
     default_group_size = 64
     default_bits = 4
 
+    # Off by default: preserve the historical RCO behavior. The pipeline turns
+    # these on for the explicit 8-bit embedding/lm_head/MTP variant.
+    quantize_embeddings = False
+    quantize_mtp = False
+
     # The source is already in MLX layout; write BF16 fallbacks under the same
     # name so the output never depends on the loader's sanitize pass.
     rename_bf16_keys = True
@@ -109,8 +114,25 @@ class Inkling2LoopAdapter(ModelAdapter):
         # (layer, projection), which is exactly the uniformity the loader needs.
         return None
 
-    def non_quantized_prefixes(self) -> List[str]:
-        return list(_BF16_COMPONENTS)
+    def non_quantized_prefixes(self) -> list[str]:
+        prefixes: list[str] = list(_BF16_COMPONENTS)
+        if self.quantize_embeddings:
+            prefixes = [p for p in prefixes if p not in ("embed_tokens", "lm_head")]
+        if self.quantize_mtp:
+            prefixes = [p for p in prefixes if p != "mtp"]
+        return prefixes
+
+    def is_mtp_key(self, key: str) -> bool:
+        # Inkling's bundled DSpark head lives in mtp.safetensors without an
+        # `mtp.` prefix: top-level `layers.N.*`, `fuse_weight`, `mask_embed`,
+        # `markov_head.*`, `norm.weight`, `confidence_head.*`.
+        return (
+            key.startswith("fuse_weight")
+            or key.startswith("mask_embed")
+            or key.startswith("markov_head.")
+            or key.startswith("confidence_head.")
+            or (key.startswith("layers.") and not key.startswith("model."))
+        )
 
     def map_key_to_mlx(self, key: str) -> Optional[str]:
         # ``stream_quantize`` rewrites ``model.language_model.X`` to

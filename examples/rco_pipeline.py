@@ -1913,6 +1913,19 @@ def main():
 
         if args.quantize_mtp and args.mtp_bits:
             _is_mtp = _mtp_key_fn(model_adapter)
+            # build_error_db_perblock has no --quantize-mtp flag, so sidecar
+            # MTP keys never enter the allocation table. Add them explicitly
+            # before the forced-width override.
+            source_keys: list[str] = []
+            for shard in sorted(source.glob("*.safetensors")):
+                with safe_open(str(shard), framework="pt", device="cpu") as f:
+                    source_keys.extend(f.keys())
+            for k in source_keys:
+                if _is_mtp(k) and _is_quantizable(
+                    k, quantize_embeddings=quantize_embeddings,
+                    quantize_mtp=True, is_mtp=_is_mtp,
+                ) and k not in assignment:
+                    assignment[k] = args.default_bits
             mtp_keys = [k for k in assignment if _is_mtp(k)]
             n_over = len(mtp_keys)
             for k in mtp_keys:
